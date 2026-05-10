@@ -49,6 +49,7 @@ class TestT18Config:
         assert config.max_stderr_bytes == 32768
         assert "uv run pytest" in config.command_allowlist
         assert "cat" in config.command_allowlist
+        assert "curl -sL" in config.command_allowlist
         assert "uniq" in config.command_allowlist
         assert "sudo" in config.command_denylist
         assert config.command_working_dirs == ["."]
@@ -112,6 +113,25 @@ class TestT19CommandPolicy:
                 ],
             },
             {"operator": "&&", "argv": ["echo", "done"], "command": "echo done"},
+        ]
+
+    def test_parse_command_sequence_allows_stderr_merge_redirect(self) -> None:
+        segments = parse_command_sequence("curl -s https://example.com 2>&1 | head -200")
+
+        assert segments == [
+            {
+                "operator": None,
+                "argv": ["curl", "-s", "https://example.com"],
+                "command": "curl -s https://example.com 2>&1 | head -200",
+                "stages": [
+                    {
+                        "argv": ["curl", "-s", "https://example.com"],
+                        "command": "curl -s https://example.com 2>&1",
+                        "merge_stderr": True,
+                    },
+                    {"argv": ["head", "-200"], "command": "head -200"},
+                ],
+            }
         ]
 
     def test_parse_command_rejects_shell_control_syntax(self) -> None:
@@ -187,6 +207,36 @@ class TestT19CommandPolicy:
         )
 
         assert evaluate_command_call("curl -s https://example.com", config) == "allow"
+
+    def test_evaluate_command_call_allows_allowlisted_curl_with_stderr_merge(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -s", "head"],
+            command_denylist=["curl"],
+        )
+
+        assert (
+            evaluate_command_call(
+                "curl -s -L --max-time 15 https://example.com 2>&1 | head -200",
+                config,
+            )
+            == "allow"
+        )
+
+    def test_evaluate_command_call_allows_allowlisted_compact_curl_flags(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -sL", "head"],
+            command_denylist=["curl"],
+        )
+
+        assert (
+            evaluate_command_call(
+                "curl -sL -o /tmp/out.html --max-time 15 https://example.com 2>&1 && head -c 200 /tmp/out.html",
+                config,
+            )
+            == "allow"
+        )
 
     @pytest.mark.parametrize(
         "command",
@@ -458,6 +508,43 @@ class TestT20RunCommand:
             thread.join(timeout=5)
 
         assert result["ok"] is True
+
+    @pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed")
+    def test_run_command_supports_allowlisted_curl_pipeline_with_stderr_merge(self, tmp_path: Path) -> None:
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b"linux-agent-curl-merged\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = make_config(
+                tmp_path,
+                command_allowlist=["curl -s", "head"],
+                command_denylist=["curl"],
+            )
+
+            result = run_command(
+                f"curl -s http://127.0.0.1:{port}/ 2>&1 | head -200",
+                config,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        assert result["ok"] is True
         assert result["exit_code"] == 0
-        assert str(len(body)) in result["stdout"]
+        assert "linux-agent-curl-merged" in result["stdout"]
+        assert result["stderr"] == ""
         assert [stage["exit_code"] for stage in result["command_segments"][0]["pipeline_stages"]] == [0, 0]

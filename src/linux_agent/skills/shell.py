@@ -57,10 +57,17 @@ def _display_cwd(config: AgentConfig, resolved_cwd: os.PathLike[str] | str) -> s
 
 
 def _stage_payload(stage: CommandStage) -> dict[str, Any]:
-    return {
+    payload = {
         "command": stage["command"],
         "argv": stage["argv"],
     }
+    if stage.get("merge_stderr"):
+        payload["merge_stderr"] = True
+    return payload
+
+
+def _collect_stderr_text(handles: list[Any | None]) -> str:
+    return "".join(_read_temp_text(handle) for handle in handles if handle is not None)
 
 
 def _segment_payload(
@@ -174,10 +181,12 @@ def run_command(
             }
 
         if len(stages) == 1:
+            stderr_target: int = subprocess.STDOUT if stages[0].get("merge_stderr") else subprocess.PIPE
             try:
                 proc = subprocess.run(
                     stages[0]["argv"],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_target,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -232,27 +241,32 @@ def run_command(
                 }
 
             stdout_parts.append(proc.stdout)
-            stderr_parts.append(proc.stderr)
+            if proc.stderr is not None:
+                stderr_parts.append(proc.stderr)
             last_exit_code = proc.returncode
             segment_results.append(
                 {**payload, "skipped": False, "exit_code": proc.returncode, "timed_out": False}
             )
             continue
 
-        stderr_files: list[Any] = []
+        stderr_files: list[Any | None] = []
         processes: list[subprocess.Popen[str]] = []
         previous_stdout: Any = None
         timed_out_stage_indexes: set[int] = set()
         final_stdout = ""
         try:
             for stage in stages:
-                stderr_file = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+                stderr_file: Any | None = None
+                stderr_target: Any = subprocess.STDOUT if stage.get("merge_stderr") else None
+                if stderr_target is None:
+                    stderr_file = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+                    stderr_target = stderr_file
                 stderr_files.append(stderr_file)
                 proc = subprocess.Popen(
                     stage["argv"],
                     stdin=previous_stdout,
                     stdout=subprocess.PIPE,
-                    stderr=stderr_file,
+                    stderr=stderr_target,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -287,7 +301,7 @@ def run_command(
 
             duration_ms = int((time.monotonic() - started_at) * 1000)
             stdout_parts.append(_coerce_stream_text(final_stdout))
-            stderr_parts.append("".join(_read_temp_text(handle) for handle in stderr_files))
+            stderr_parts.append(_collect_stderr_text(stderr_files))
             pipeline_stage_results = [
                 {
                     **_stage_payload(stage),
@@ -329,7 +343,7 @@ def run_command(
                     continue
 
             duration_ms = int((time.monotonic() - started_at) * 1000)
-            stderr_parts.append("".join(_read_temp_text(handle) for handle in stderr_files))
+            stderr_parts.append(_collect_stderr_text(stderr_files))
             pipeline_stage_results = [
                 {
                     **_stage_payload(stage),
@@ -365,9 +379,10 @@ def run_command(
         finally:
             if previous_stdout is not None and not previous_stdout.closed:
                 previous_stdout.close()
-            stderr_text = "".join(_read_temp_text(handle) for handle in stderr_files)
+            stderr_text = _collect_stderr_text(stderr_files)
             for handle in stderr_files:
-                handle.close()
+                if handle is not None:
+                    handle.close()
 
         stdout_parts.append(_coerce_stream_text(final_stdout))
         stderr_parts.append(stderr_text)

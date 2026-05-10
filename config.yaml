@@ -32,6 +32,7 @@ command_allowlist:
   - find
   - rg
   - curl -s
+  - curl -sL
   - cat
   - head
   - tail

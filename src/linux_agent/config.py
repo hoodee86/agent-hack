@@ -80,6 +80,7 @@ class AgentConfig(BaseModel):
             "rg",
             "cat",
             "head",
+            "curl -sL",
             "tail",
             "sort",
             "uniq",

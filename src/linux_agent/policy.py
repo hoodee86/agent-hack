@@ -71,6 +71,7 @@ class CommandStage(TypedDict):
 
     argv: list[str]
     command: str
+    merge_stderr: NotRequired[bool]
 
 
 class PolicyAssessment(TypedDict):
@@ -237,11 +238,15 @@ def _is_unsupported_shell_token(token: str) -> bool:
     return False
 
 
-def _build_command_stage(argv: list[str]) -> CommandStage:
+def _build_command_stage(argv: list[str], *, merge_stderr: bool = False) -> CommandStage:
     if not argv:
         raise PolicyViolation("unsupported shell syntax in command")
     stage_argv = list(argv)
-    return CommandStage(argv=stage_argv, command=shlex.join(stage_argv))
+    stage = CommandStage(argv=stage_argv, command=shlex.join(stage_argv))
+    if merge_stderr:
+        stage["merge_stderr"] = True
+        stage["command"] = f"{stage['command']} 2>&1"
+    return stage
 
 
 def command_segment_stages(segment: CommandSegment) -> list[CommandStage]:
@@ -255,19 +260,21 @@ def parse_command_sequence(raw: str) -> list[CommandSegment]:
     """Parse a command string into sequential command segments.
 
     Supported separators are ``&&``, ``||``, and ``;``. Each segment may also
-    contain a pipeline joined with ``|``. Unsupported shell features such as
-    redirection, subshells, and background execution still raise
+    contain a pipeline joined with ``|``. The only supported redirection is
+    ``2>&1`` to merge stderr into stdout for a stage. Other shell features such
+    as subshells and background execution still raise
     ``PolicyViolation``.
     """
     tokens = _tokenize_command(raw)
     segments: list[CommandSegment] = []
     argv: list[str] = []
     stages: list[CommandStage] = []
+    merge_stderr = False
     next_operator: Literal["&&", "||", ";"] | None = None
 
     def _flush_segment() -> None:
-        nonlocal argv, stages
-        stage = _build_command_stage(argv)
+        nonlocal argv, stages, merge_stderr
+        stage = _build_command_stage(argv, merge_stderr=merge_stderr)
         all_stages = [*stages, stage]
         segment = CommandSegment(
             operator=next_operator,
@@ -279,14 +286,31 @@ def parse_command_sequence(raw: str) -> list[CommandSegment]:
         segments.append(segment)
         argv = []
         stages = []
+        merge_stderr = False
 
-    for token in tokens:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if (
+            token == "2"
+            and index + 2 < len(tokens)
+            and tokens[index + 1] == ">&"
+            and tokens[index + 2] == "1"
+        ):
+            if not argv:
+                raise PolicyViolation("unsupported shell syntax in command", path=raw)
+            merge_stderr = True
+            index += 3
+            continue
+
         if _is_unsupported_shell_token(token):
             raise PolicyViolation("unsupported shell syntax in command", path=raw)
 
         if token == _SUPPORTED_PIPE_OPERATOR:
-            stages.append(_build_command_stage(argv))
+            stages.append(_build_command_stage(argv, merge_stderr=merge_stderr))
             argv = []
+            merge_stderr = False
+            index += 1
             continue
 
         if token in _SUPPORTED_SEQUENCE_OPERATORS:
@@ -294,9 +318,11 @@ def parse_command_sequence(raw: str) -> list[CommandSegment]:
                 raise PolicyViolation("unsupported shell syntax in command", path=raw)
             _flush_segment()
             next_operator = cast("Literal['&&', '||', ';']", token)
+            index += 1
             continue
 
         argv.append(token)
+        index += 1
 
     if not argv:
         raise PolicyViolation("unsupported shell syntax in command", path=raw)
