@@ -1,0 +1,259 @@
+"""
+T16 – Unit tests for app.py (CLI entry point).
+
+Tests exercise argument parsing and config resolution without hitting
+the LangGraph runtime (the graph call is monkeypatched).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from linux_agent.app import main
+from linux_agent.state import AgentState
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fake_final_state(answer: str, iterations: int = 1) -> AgentState:
+    return AgentState(
+        run_id="test-run",
+        user_goal="test goal",
+        workspace_root="/tmp",
+        messages=[],
+        plan=[],
+        current_step=None,
+        proposed_tool_call=None,
+        observations=[],
+        risk_decision=None,
+        iteration_count=iterations,
+        consecutive_failures=0,
+        final_answer=answer,
+    )
+
+
+def _mock_graph(answer: str = "OK") -> MagicMock:
+    """Return a mock compiled graph whose invoke() returns a fixed final state."""
+    app = MagicMock()
+    app.invoke.return_value = _fake_final_state(answer)
+    graph_mock = MagicMock(return_value=app)
+    return graph_mock
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCLIArguments:
+    def test_missing_goal_exits_nonzero(self, tmp_path: Path, capsys: Any) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main([])
+        assert exc_info.value.code != 0
+
+    def test_goal_only_succeeds(self, tmp_path: Path, capsys: Any) -> None:
+        """Goal-only invocation uses --workspace derived from env (patched config)."""
+        with (
+            patch("linux_agent.app.build_graph", _mock_graph("Done")),
+            patch(
+                "linux_agent.app.load_config",
+                return_value=MagicMock(
+                    workspace_root=tmp_path,
+                    log_dir=tmp_path / "logs",
+                    max_iterations=12,
+                    max_consecutive_failures=3,
+                    llm_model="gpt-4o",
+                    model_dump=MagicMock(
+                        return_value={
+                            "workspace_root": tmp_path,
+                            "log_dir": tmp_path / "logs",
+                            "max_iterations": 12,
+                            "max_consecutive_failures": 3,
+                            "llm_model": "gpt-4o",
+                            "llm_temperature": 0.0,
+                            "max_read_bytes": 65536,
+                            "max_search_results": 100,
+                            "max_list_entries": 200,
+                            "sensitive_path_parts": [],
+                        }
+                    ),
+                ),
+            ),
+        ):
+            code = main(["What files are here?"])
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Done" in out
+
+    def test_workspace_override(self, tmp_path: Path, capsys: Any) -> None:
+        """--workspace flag overrides workspace_root from config."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        with (
+            patch("linux_agent.app.build_graph", _mock_graph("WorkspaceOK")),
+            patch(
+                "linux_agent.app.load_config",
+                return_value=MagicMock(
+                    workspace_root=tmp_path,
+                    log_dir=tmp_path / "logs",
+                    max_iterations=12,
+                    max_consecutive_failures=3,
+                    llm_model="gpt-4o",
+                    model_dump=MagicMock(
+                        return_value={
+                            "workspace_root": tmp_path,
+                            "log_dir": tmp_path / "logs",
+                            "max_iterations": 12,
+                            "max_consecutive_failures": 3,
+                            "llm_model": "gpt-4o",
+                            "llm_temperature": 0.0,
+                            "max_read_bytes": 65536,
+                            "max_search_results": 100,
+                            "max_list_entries": 200,
+                            "sensitive_path_parts": [],
+                        }
+                    ),
+                ),
+            ),
+        ):
+            code = main(["goal", "--workspace", str(ws)])
+        assert code == 0
+
+    def test_nonexistent_workspace_returns_error(self, tmp_path: Path) -> None:
+        """--workspace pointing at a nonexistent path should return exit code 1."""
+        with patch(
+            "linux_agent.app.load_config",
+            return_value=MagicMock(
+                workspace_root=tmp_path,
+                log_dir=tmp_path / "logs",
+                max_iterations=12,
+                max_consecutive_failures=3,
+                llm_model="gpt-4o",
+                model_dump=MagicMock(return_value={}),
+            ),
+        ):
+            code = main(["goal", "--workspace", "/nonexistent/path/xyz"])
+        assert code == 1
+
+    def test_config_error_returns_exit_1(self, tmp_path: Path) -> None:
+        """A ValueError from load_config should result in exit code 1."""
+        with patch(
+            "linux_agent.app.load_config",
+            side_effect=ValueError("bad workspace"),
+        ):
+            code = main(["goal"])
+        assert code == 1
+
+    def test_verbose_flag_prints_to_stderr(self, tmp_path: Path, capsys: Any) -> None:
+        with (
+            patch("linux_agent.app.build_graph", _mock_graph("Verbose")),
+            patch(
+                "linux_agent.app.load_config",
+                return_value=MagicMock(
+                    workspace_root=tmp_path,
+                    log_dir=tmp_path / "logs",
+                    max_iterations=12,
+                    max_consecutive_failures=3,
+                    llm_model="gpt-4o",
+                    model_dump=MagicMock(
+                        return_value={
+                            "workspace_root": tmp_path,
+                            "log_dir": tmp_path / "logs",
+                            "max_iterations": 12,
+                            "max_consecutive_failures": 3,
+                            "llm_model": "gpt-4o",
+                            "llm_temperature": 0.0,
+                            "max_read_bytes": 65536,
+                            "max_search_results": 100,
+                            "max_list_entries": 200,
+                            "sensitive_path_parts": [],
+                        }
+                    ),
+                ),
+            ),
+        ):
+            code = main(["goal", "--verbose"])
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "run_id" in err
+
+    def test_output_printed_to_stdout(self, tmp_path: Path, capsys: Any) -> None:
+        with (
+            patch("linux_agent.app.build_graph", _mock_graph("The answer is 42")),
+            patch(
+                "linux_agent.app.load_config",
+                return_value=MagicMock(
+                    workspace_root=tmp_path,
+                    log_dir=tmp_path / "logs",
+                    max_iterations=12,
+                    max_consecutive_failures=3,
+                    llm_model="gpt-4o",
+                    model_dump=MagicMock(
+                        return_value={
+                            "workspace_root": tmp_path,
+                            "log_dir": tmp_path / "logs",
+                            "max_iterations": 12,
+                            "max_consecutive_failures": 3,
+                            "llm_model": "gpt-4o",
+                            "llm_temperature": 0.0,
+                            "max_read_bytes": 65536,
+                            "max_search_results": 100,
+                            "max_list_entries": 200,
+                            "sensitive_path_parts": [],
+                        }
+                    ),
+                ),
+            ),
+        ):
+            code = main(["What is 6*7?"])
+        assert code == 0
+        assert "The answer is 42" in capsys.readouterr().out
+
+    def test_audit_run_start_log_written(self, tmp_path: Path) -> None:
+        """main() must write a run_start event to the JSONL audit log."""
+        import json
+
+        log_dir = tmp_path / "logs"
+        with (
+            patch("linux_agent.app.build_graph", _mock_graph("OK")),
+            patch(
+                "linux_agent.app.load_config",
+                return_value=MagicMock(
+                    workspace_root=tmp_path,
+                    log_dir=log_dir,
+                    max_iterations=5,
+                    max_consecutive_failures=2,
+                    llm_model="gpt-4o",
+                    model_dump=MagicMock(
+                        return_value={
+                            "workspace_root": tmp_path,
+                            "log_dir": log_dir,
+                            "max_iterations": 5,
+                            "max_consecutive_failures": 2,
+                            "llm_model": "gpt-4o",
+                            "llm_temperature": 0.0,
+                            "max_read_bytes": 65536,
+                            "max_search_results": 100,
+                            "max_list_entries": 200,
+                            "sensitive_path_parts": [],
+                        }
+                    ),
+                ),
+            ),
+        ):
+            main(["Hello"])
+
+        log_files = list(log_dir.glob("*.jsonl"))
+        assert len(log_files) == 1
+        events = [
+            json.loads(ln)
+            for ln in log_files[0].read_text().splitlines()
+            if ln.strip()
+        ]
+        assert any(e["event"] == "run_start" for e in events)
