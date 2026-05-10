@@ -208,9 +208,11 @@ def _make_planner(
     """Return a Planner node function closed over *config* and *llm*.
 
     Supports three structured-output strategies via config.llm_structured_output_method:
-    - "function_calling" : bind_tools without forced tool_choice (DeepSeek / most providers)
-    - "json_schema"      : OpenAI json_schema mode (GPT-4o, o-series)
-    - "prompt"           : pure text + JSON extraction (fallback for any model)
+    - "prompt"           : JSON schema embedded in system prompt; parse text response.
+                           Works with ALL models including DeepSeek-V4-Pro. (recommended)
+    - "json_schema"      : OpenAI json_schema response_format (GPT-4o, o-series only)
+    - "function_calling" : bind_tools without forced tool_choice.
+                           May confuse models when PlannerDecision contains generic dict fields.
     """
     method = config.llm_structured_output_method
 
