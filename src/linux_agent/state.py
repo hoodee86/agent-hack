@@ -20,7 +20,7 @@ class ToolCall(TypedDict):
 
     # Provider-generated tool-call id so ToolMessage can be correlated
     id: str
-    # Tool name – one of: list_dir | read_file | search_text (phase 1)
+    # Tool name – one of: list_dir | read_file | search_text | run_command
     name: str
     # Raw arguments forwarded to the skill function unchanged
     args: dict[str, object]
@@ -35,7 +35,8 @@ class Observation(TypedDict):
     tool: str
     # True when the skill returned without error
     ok: bool
-    # Structured payload returned by the skill (None when ok=False)
+    # Structured payload returned by the skill, including failure metadata
+    # when a tool reports a structured error result.
     result: dict[str, object] | None
     # Human-readable error description (None when ok=True)
     error: str | None

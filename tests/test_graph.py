@@ -210,6 +210,31 @@ class TestGraphHappyPath:
         assert result["final_answer"] == "Found def main in src.py"
         assert result["iteration_count"] == 1
 
+    def test_run_command_then_done(self, tmp_path: Path) -> None:
+        """Planner can execute run_command and preserve command metadata."""
+        cfg = _make_config(tmp_path)
+        llm = _stub_llm(
+            _tool_turn(
+                "run_command",
+                {"command": "pwd", "cwd": "."},
+                content="Running pwd to confirm the workspace root",
+            ),
+            _final_turn("Command completed."),
+        )
+        app = build_graph(cfg, chat_model=llm)
+
+        result = app.invoke(_initial_state("Confirm the working directory", str(tmp_path)))
+
+        assert result["observations"][0]["tool"] == "run_command"
+        assert result["observations"][0]["ok"] is True
+        command_result = result["observations"][0]["result"]
+        assert command_result is not None
+        assert command_result["command"] == "pwd"
+        assert command_result["cwd"] == "."
+        assert command_result["exit_code"] == 0
+        assert "Executed commands:" in (result["final_answer"] or "")
+        assert "pwd [cwd=.] -> ok" in (result["final_answer"] or "")
+
     def test_tool_messages_follow_tool_calls_before_next_human_turn(self, tmp_path: Path) -> None:
         """Planner history must preserve assistant/tool adjacency across turns."""
         (tmp_path / "src.py").write_text("def main():\n    pass\n")
@@ -287,6 +312,59 @@ class TestGraphHappyPath:
         ]
         second_roles = [message["type"] for message in traces[1]["data"]["messages"]]
         assert second_roles[-3:] == ["ai", "tool", "human"]
+
+    def test_failed_command_is_preserved_for_follow_up_and_summary(self, tmp_path: Path) -> None:
+        """Failed run_command observations must retain structured stderr and exit data."""
+        cfg = _make_config(tmp_path)
+        llm = _stub_llm(
+            _tool_turn(
+                "run_command",
+                {"command": "find missing-dir", "cwd": "."},
+                content="Running find to inspect missing-dir",
+            ),
+            _final_turn("The command failed; inspect missing-dir before retrying."),
+        )
+        events: list[dict[str, Any]] = []
+        app = build_graph(cfg, chat_model=llm, event_listener=events.append)
+
+        result = app.invoke(_initial_state("Inspect missing-dir", str(tmp_path)))
+
+        command_result = result["observations"][0]["result"]
+        assert result["observations"][0]["tool"] == "run_command"
+        assert result["observations"][0]["ok"] is False
+        assert command_result is not None
+        assert command_result["exit_code"] not in (None, 0)
+        assert command_result["stderr"] or command_result["stdout"]
+        assert "Executed commands:" in (result["final_answer"] or "")
+        assert "find missing-dir [cwd=.] -> failed" in (result["final_answer"] or "")
+        assert any(
+            event["event"] == "reflector_action"
+            and event["data"].get("reason") == "command_failed"
+            for event in events
+        )
+
+    def test_command_timeout_stops_with_explicit_timeout_summary(self, tmp_path: Path) -> None:
+        """Reflector should stop immediately when a command times out."""
+        test_file = tmp_path / "test_sleep.py"
+        test_file.write_text(
+            "import time\n\n\ndef test_sleep() -> None:\n    time.sleep(2)\n",
+            encoding="utf-8",
+        )
+        cfg = _make_config(tmp_path)
+        llm = _stub_llm(
+            _tool_turn(
+                "run_command",
+                {"command": "pytest -q", "cwd": ".", "timeout_seconds": 1},
+                content="Running pytest with a short timeout",
+            )
+        )
+        app = build_graph(cfg, chat_model=llm)
+
+        result = app.invoke(_initial_state("Run tests quickly", str(tmp_path)))
+
+        assert "timed out" in (result["final_answer"] or "").lower()
+        assert "Executed commands:" in (result["final_answer"] or "")
+        assert "pytest -q [cwd=.] -> timed out" in (result["final_answer"] or "")
 
 
 class TestGraphSecurityBlocking:
@@ -370,3 +448,33 @@ class TestAuditLogging:
         events = [_json.loads(ln) for ln in log_file.read_text().splitlines() if ln]
         event_types = [e["event"] for e in events]
         assert "run_end" in event_types
+
+    def test_run_command_events_include_command_metadata(self, tmp_path: Path) -> None:
+        """Command tool audit records should expose command-specific fields."""
+        import json as _json
+
+        log_dir = tmp_path / "logs"
+        cfg = _make_config(tmp_path, log_dir=log_dir)
+        run_id = str(uuid.uuid4())
+        llm = _stub_llm(
+            _tool_turn(
+                "run_command",
+                {"command": "pwd", "cwd": "."},
+                content="Running pwd",
+            ),
+            _final_turn("Done."),
+        )
+        app = build_graph(cfg, chat_model=llm)
+        state = _initial_state("Run pwd", str(tmp_path))
+        state = AgentState(**{**state, "run_id": run_id})  # type: ignore[misc]
+
+        app.invoke(state)
+
+        events = [_json.loads(ln) for ln in (log_dir / f"{run_id}.jsonl").read_text().splitlines() if ln]
+        by_type = {event["event"]: event for event in events if event["event"] in {"tool_proposed", "policy_decision", "tool_result", "run_end"}}
+        assert by_type["tool_proposed"]["data"]["command"] == "pwd"
+        assert by_type["tool_proposed"]["data"]["argv"] == ["pwd"]
+        assert by_type["policy_decision"]["data"]["cwd"] == "."
+        assert by_type["tool_result"]["data"]["exit_code"] == 0
+        assert by_type["tool_result"]["data"]["command"] == "pwd"
+        assert by_type["run_end"]["data"]["command_count"] == 1

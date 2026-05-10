@@ -261,7 +261,37 @@ class TestScenarioSearchText:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scenario 4 – security block (path traversal)
+# Scenario 4 – run_command
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestScenarioRunCommand:
+    def test_agent_runs_safe_command_and_summarizes_it(self, tmp_path: Path) -> None:
+        """Agent can execute run_command and surface the command summary downstream."""
+        cfg = _make_config(tmp_path)
+        llm = _stub(
+            _tool_turn(
+                "run_command",
+                {"command": "pwd", "cwd": "."},
+                content="Running pwd to inspect the workspace root",
+            ),
+            _final_turn("The workspace root is confirmed."),
+        )
+        app = build_graph(cfg, chat_model=llm)
+
+        result = app.invoke(_initial_state("Confirm the current working directory", str(tmp_path)))
+
+        obs = result["observations"][0]
+        assert obs["tool"] == "run_command"
+        assert obs["ok"] is True
+        assert obs["result"] is not None
+        assert obs["result"]["command"] == "pwd"  # type: ignore[index]
+        assert obs["result"]["exit_code"] == 0  # type: ignore[index]
+        assert "Executed commands:" in (result["final_answer"] or "")
+        assert "pwd [cwd=.] -> ok" in (result["final_answer"] or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scenario 5 – security block (path traversal)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestScenarioSecurityBlock:
@@ -320,7 +350,7 @@ class TestScenarioSecurityBlock:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scenario 5 – iteration limit (circuit breaker)
+# Scenario 6 – iteration limit (circuit breaker)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestScenarioIterationLimit:
@@ -356,7 +386,7 @@ class TestScenarioIterationLimit:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scenario 6 – audit log completeness
+# Scenario 7 – audit log completeness
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestScenarioAuditLog:

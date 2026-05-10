@@ -12,7 +12,7 @@
 - 对高风险操作触发人工确认或策略拒绝。
 - 记录完整行动轨迹，便于调试、复盘和安全审计。
 
-> 当前仓库已完整覆盖第一阶段只读能力，并已落地第二阶段的基础设施：命令执行配置、命令策略解析与 `run_command` skill。默认仍使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`，并使用原生 tool calling 驱动 `list_dir` / `read_file` / `search_text`。第二阶段的 graph 集成与第三阶段的审批写入链路仍属于后续工作。
+> 当前仓库已完整覆盖第一阶段只读能力，并已落地第二阶段的核心执行链路：命令执行配置、命令策略解析、`run_command` skill、graph 集成、命令审计与 verbose 输出、以及命令结果驱动的 Reflector / Finalizer 总结。默认仍使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`。第三阶段的审批写入链路仍属于后续工作。
 
 ## 2. 范围与非目标
 

@@ -14,7 +14,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from linux_agent.audit import EVENT_MODEL_INPUT, EVENT_PLAN_UPDATE, EVENT_TOOL_RESULT
+from linux_agent.audit import (
+    EVENT_MODEL_INPUT,
+    EVENT_PLAN_UPDATE,
+    EVENT_POLICY_DECISION,
+    EVENT_TOOL_PROPOSED,
+    EVENT_TOOL_RESULT,
+)
 from linux_agent.app import main
 from linux_agent.state import AgentState
 
@@ -68,7 +74,7 @@ def _mock_graph_with_events(answer: str = "OK") -> MagicMock:
                             "messages": [
                                 {
                                     "type": "system",
-                                    "content": "You are a read-only Linux filesystem agent.",
+                                    "content": "You are a controlled Linux workspace agent.",
                                 },
                                 {
                                     "type": "human",
@@ -328,7 +334,145 @@ class TestCLIArguments:
         assert "Message Count: 2" in err
         assert "[1] system" in err
         assert "[2] human" in err
-        assert "You are a read-only Linux filesystem agent." in err
+        assert "You are a controlled Linux workspace agent." in err
+
+    def test_verbose_prints_command_execution_details(self, tmp_path: Path, capsys: Any) -> None:
+        def _mock_graph_with_command_events(*args: Any, **kwargs: Any) -> MagicMock:
+            event_listener = kwargs.get("event_listener")
+            app = MagicMock()
+
+            def _invoke(state: AgentState) -> AgentState:
+                assert event_listener is not None
+                event_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:00+00:00",
+                        "event": EVENT_PLAN_UPDATE,
+                        "data": {
+                            "plan": ["Run pytest"],
+                            "current_step": "Running pytest to inspect failures",
+                            "assistant_content": "I will run pytest -q.",
+                            "final_answer": None,
+                        },
+                    }
+                )
+                event_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:01+00:00",
+                        "event": EVENT_TOOL_PROPOSED,
+                        "data": {
+                            "tool": "run_command",
+                            "tool_call_id": "call_1",
+                            "risk_level": "low",
+                            "args": {"command": "uv run pytest -q", "cwd": "."},
+                            "command": "uv run pytest -q",
+                            "argv": ["uv", "run", "pytest", "-q"],
+                            "cwd": ".",
+                        },
+                    }
+                )
+                event_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:02+00:00",
+                        "event": EVENT_POLICY_DECISION,
+                        "data": {
+                            "tool": "run_command",
+                            "tool_call_id": "call_1",
+                            "risk_level": "low",
+                            "args": {"command": "uv run pytest -q", "cwd": "."},
+                            "command": "uv run pytest -q",
+                            "argv": ["uv", "run", "pytest", "-q"],
+                            "cwd": ".",
+                            "decision": "allow",
+                        },
+                    }
+                )
+                event_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:03+00:00",
+                        "event": EVENT_TOOL_RESULT,
+                        "data": {
+                            "tool": "run_command",
+                            "tool_call_id": "call_1",
+                            "risk_level": "low",
+                            "ok": False,
+                            "duration_ms": 321,
+                            "error": "command exited with status 1",
+                            "command": "uv run pytest -q",
+                            "argv": ["uv", "run", "pytest", "-q"],
+                            "cwd": ".",
+                            "exit_code": 1,
+                            "timed_out": False,
+                            "truncated": True,
+                            "stdout_preview": "1 failed, 3 passed",
+                            "stderr_preview": "tests/test_example.py:12: AssertionError",
+                            "result": {
+                                "ok": False,
+                                "command": "uv run pytest -q",
+                                "argv": ["uv", "run", "pytest", "-q"],
+                                "cwd": ".",
+                                "exit_code": 1,
+                                "stdout": "1 failed, 3 passed",
+                                "stderr": "tests/test_example.py:12: AssertionError",
+                                "duration_ms": 321,
+                                "timed_out": False,
+                                "truncated": True,
+                            },
+                        },
+                    }
+                )
+                return _fake_final_state("Command summary")
+
+            app.invoke.side_effect = _invoke
+            return app
+
+        with (
+            patch(
+                "linux_agent.app.build_graph",
+                MagicMock(side_effect=_mock_graph_with_command_events),
+            ),
+            patch(
+                "linux_agent.app.load_config",
+                return_value=MagicMock(
+                    workspace_root=tmp_path,
+                    log_dir=tmp_path / "logs",
+                    max_iterations=12,
+                    max_consecutive_failures=3,
+                    llm_model="deepseek-v4-pro",
+                    model_dump=MagicMock(
+                        return_value={
+                            "workspace_root": tmp_path,
+                            "log_dir": tmp_path / "logs",
+                            "max_iterations": 12,
+                            "max_consecutive_failures": 3,
+                            "llm_model": "deepseek-v4-pro",
+                            "llm_temperature": 0.0,
+                            "max_read_bytes": 65536,
+                            "max_search_results": 100,
+                            "max_list_entries": 200,
+                            "sensitive_path_parts": [],
+                        }
+                    ),
+                ),
+            ),
+        ):
+            code = main(["goal", "--verbose"])
+
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "[linux-agent] Iteration 1 | Tool Proposal" in err
+        assert "Command: uv run pytest -q" in err
+        assert "Working Directory: ." in err
+        assert "[linux-agent] Iteration 1 | Policy Guard" in err
+        assert "Decision: allow" in err
+        assert "[linux-agent] Iteration 1 | Tool Result" in err
+        assert "Exit Code: 1" in err
+        assert "Truncated: True" in err
+        assert "Stdout:" in err
+        assert "Stderr:" in err
 
     def test_output_printed_to_stdout(self, tmp_path: Path, capsys: Any) -> None:
         with (

@@ -52,9 +52,15 @@ from linux_agent.audit import (
     AuditLogger,
 )
 from linux_agent.config import AgentConfig
-from linux_agent.policy import PolicyViolation, evaluate_tool_call
+from linux_agent.policy import (
+    PolicyViolation,
+    classify_command,
+    evaluate_tool_call,
+    parse_command,
+)
 from linux_agent.skills.filesystem import list_dir, read_file
 from linux_agent.skills.search import search_text
+from linux_agent.skills.shell import run_command
 from linux_agent.state import AgentState, Observation, ToolCall
 
 
@@ -89,7 +95,18 @@ def search_text_tool(
     raise RuntimeError("search_text is executed by linux_agent.graph, not by LangChain.")
 
 
-_MODEL_TOOLS = [list_dir_tool, read_file_tool, search_text_tool]
+@tool("run_command")
+def run_command_tool(
+    command: str,
+    cwd: str = ".",
+    timeout_seconds: int | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Run a safe developer command inside the workspace, such as tests, lint, type checks, or git status."""
+    raise RuntimeError("run_command is executed by linux_agent.graph, not by LangChain.")
+
+
+_MODEL_TOOLS = [list_dir_tool, read_file_tool, search_text_tool, run_command_tool]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,9 +114,10 @@ _MODEL_TOOLS = [list_dir_tool, read_file_tool, search_text_tool]
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
-You are a read-only Linux filesystem agent.
-Your task is to answer the user's goal by exploring the filesystem with
-the tools provided. You MUST NOT write, delete, or modify any files.
+You are a controlled Linux workspace agent.
+Your task is to answer the user's goal by inspecting the workspace and,
+when useful, running tightly constrained developer commands. You MUST NOT
+write, delete, or modify any files.
 
 ## Available tools
 
@@ -108,15 +126,21 @@ the tools provided. You MUST NOT write, delete, or modify any files.
 | list_dir    | path: str (workspace-relative)  | recursive: bool (default false)                        |
 | read_file   | path: str (workspace-relative)  | start_line: int (1-based), end_line: int               |
 | search_text | query: str                      | path: str (default "."), glob: str, context_lines: int |
+| run_command | command: str                    | cwd: str (default "."), timeout_seconds: int, env: dict |
 
-All paths must be relative to the workspace root. Use "." for the root itself.
+All paths and working directories must stay within the workspace root.
 
 ## Rules
 
-- Use tool calling directly when you need more evidence.
+- Use list_dir, read_file, and search_text to inspect files and source code.
+- Use run_command only for safe developer commands such as tests, lint, type checks,
+    build diagnostics, or git status/diff.
+- Never request shell control syntax such as pipes, redirection, chaining, background
+    execution, or shell wrappers.
 - Call at most one tool at a time.
+- After a command fails, inspect the referenced files or error locations before retrying.
 - Answer in plain text when you already have enough information.
-- Do not invent files, directories, or file contents.
+- Do not invent files, directories, file contents, command outputs, or test results.
 - Keep tool arguments minimal and precise.
 """
 
@@ -130,11 +154,7 @@ def _fmt_observations(observations: list[Observation], n: int = 5) -> str:
     parts: list[str] = []
     for i, obs in enumerate(recent, start=start_idx):
         status = "OK" if obs["ok"] else "ERROR"
-        if obs["ok"] and obs["result"]:
-            raw = json.dumps(obs["result"], ensure_ascii=False)
-            detail = raw[:600] + " …" if len(raw) > 600 else raw
-        else:
-            detail = obs["error"] or ""
+        detail = _format_observation_detail(obs)
         parts.append(
             f"[{i}] tool={obs['tool']}  status={status}  "
             f"duration={obs['duration_ms']}ms\n{detail}"
@@ -185,6 +205,146 @@ def _serialize_tool_payload(obs: Observation, limit: int = 4000) -> str:
     if len(text) > limit:
         return text[:limit] + " …"
     return text
+
+
+def _preview_text(value: Any, *, limit: int = 320) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    clipped = "\n".join(line.rstrip() for line in text.splitlines()[:12]).strip()
+    if len(clipped) > limit:
+        return clipped[:limit] + " …"
+    return clipped
+
+
+def _command_follow_up_hint(result: dict[str, Any]) -> str:
+    command = str(result.get("command", "")).lower()
+    if "pytest" in command:
+        return (
+            "Read the failing test or source files mentioned in the output before "
+            "retrying the test command."
+        )
+    if "mypy" in command or "ruff" in command:
+        return (
+            "Inspect the reported file and line range with read_file before rerunning "
+            "the command."
+        )
+    return (
+        "Use read_file or search_text to inspect the files or errors referenced by "
+        "the command output before retrying."
+    )
+
+
+def _format_observation_detail(obs: Observation) -> str:
+    result = obs.get("result")
+    if isinstance(result, dict):
+        if obs["tool"] == "run_command":
+            lines = [
+                f"command={result.get('command', '(unknown)')}  cwd={result.get('cwd', '.')}",
+                (
+                    f"exit_code={result.get('exit_code')}  "
+                    f"timed_out={bool(result.get('timed_out', False))}  "
+                    f"truncated={bool(result.get('truncated', False))}"
+                ),
+            ]
+            stderr_preview = _preview_text(result.get("stderr"), limit=500)
+            stdout_preview = _preview_text(result.get("stdout"), limit=500)
+            if stderr_preview is not None:
+                lines.append(f"stderr:\n{stderr_preview}")
+            if stdout_preview is not None:
+                lines.append(f"stdout:\n{stdout_preview}")
+            if result.get("timed_out") or result.get("truncated") or not obs["ok"]:
+                lines.append(f"follow_up_hint: {_command_follow_up_hint(result)}")
+            return "\n".join(lines)
+
+        raw = json.dumps(result, ensure_ascii=False)
+        return raw[:600] + " …" if len(raw) > 600 else raw
+
+    return obs["error"] or ""
+
+
+def _command_fields_from_args(args: dict[str, object]) -> dict[str, Any]:
+    payload: dict[str, Any] = {"cwd": str(args.get("cwd", "."))}
+    raw_command = args.get("command")
+    if isinstance(raw_command, str) and raw_command.strip():
+        payload["command"] = raw_command.strip()
+        try:
+            payload["argv"] = parse_command(raw_command)
+        except PolicyViolation:
+            pass
+    timeout_seconds = args.get("timeout_seconds")
+    if timeout_seconds is not None:
+        payload["timeout_seconds"] = timeout_seconds
+    raw_env = args.get("env")
+    if isinstance(raw_env, dict):
+        payload["env_keys"] = sorted(str(key) for key in raw_env)
+    return payload
+
+
+def _command_fields_from_result(result: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+
+    payload: dict[str, Any] = {}
+    for key in ("command", "argv", "cwd", "exit_code", "timed_out", "truncated"):
+        if key in result and result.get(key) is not None:
+            payload[key] = result.get(key)
+
+    stdout_preview = _preview_text(result.get("stdout"), limit=600)
+    stderr_preview = _preview_text(result.get("stderr"), limit=600)
+    if stdout_preview is not None:
+        payload["stdout_preview"] = stdout_preview
+    if stderr_preview is not None:
+        payload["stderr_preview"] = stderr_preview
+    return payload
+
+
+def _tool_call_audit_payload(tool_call: ToolCall) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "tool": tool_call["name"],
+        "tool_call_id": tool_call["id"],
+        "risk_level": tool_call["risk_level"],
+        "args": tool_call["args"],
+    }
+    if tool_call["name"] == "run_command":
+        payload.update(_command_fields_from_args(tool_call["args"]))
+    return payload
+
+
+def _tool_result_audit_payload(tool_call: ToolCall, obs: Observation) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "tool": obs["tool"],
+        "tool_call_id": tool_call["id"],
+        "risk_level": tool_call["risk_level"],
+        "ok": obs["ok"],
+        "duration_ms": obs["duration_ms"],
+        "error": obs["error"],
+        "result": obs["result"],
+    }
+    if obs["tool"] == "run_command":
+        payload.update(_command_fields_from_result(obs["result"]))
+    return payload
+
+
+def _classify_tool_risk(
+    name: str,
+    args: dict[str, object],
+    config: AgentConfig,
+) -> str:
+    if name != "run_command":
+        return "low"
+
+    raw_command = args.get("command")
+    if not isinstance(raw_command, str):
+        return "high"
+
+    try:
+        argv = parse_command(raw_command)
+    except PolicyViolation:
+        return "high"
+    return classify_command(argv, config)
 
 
 def _serialize_trace_message(message: BaseMessage) -> dict[str, Any]:
@@ -284,7 +444,11 @@ def _coerce_tool_args(raw_args: Any) -> dict[str, object]:
     return {}
 
 
-def _build_tool_call(message: AIMessage, state: AgentState) -> ToolCall | None:
+def _build_tool_call(
+    message: AIMessage,
+    state: AgentState,
+    config: AgentConfig,
+) -> ToolCall | None:
     tool_calls = message.tool_calls or []
     if not tool_calls:
         return None
@@ -296,17 +460,119 @@ def _build_tool_call(message: AIMessage, state: AgentState) -> ToolCall | None:
 
     raw_id = raw_call.get("id")
     call_id = str(raw_id) if raw_id else f"{raw_name}_{state['iteration_count'] + 1}"
+    args = _coerce_tool_args(raw_call.get("args", {}))
     return ToolCall(
         id=call_id,
         name=raw_name,
-        args=_coerce_tool_args(raw_call.get("args", {})),
-        risk_level="low",
+        args=args,
+        risk_level=cast(str, _classify_tool_risk(raw_name, args, config)),
     )
 
 
 def _tool_step(tool_call: ToolCall) -> str:
+    if tool_call["name"] == "run_command":
+        command = str(tool_call["args"].get("command", ""))
+        cwd = str(tool_call["args"].get("cwd", "."))
+        return f"Running command {command} (cwd={cwd})"
     args_json = json.dumps(tool_call["args"], ensure_ascii=False)
     return f"Calling {tool_call['name']} {args_json}"
+
+
+def _command_reflection_payload(obs: Observation) -> dict[str, Any] | None:
+    result = obs.get("result")
+    if obs["tool"] != "run_command" or not isinstance(result, dict):
+        return None
+
+    payload = _command_fields_from_result(result)
+    payload["tool"] = obs["tool"]
+    if result.get("timed_out"):
+        payload.update(
+            {
+                "reason": "command_timeout",
+                "action": "stop_after_timeout",
+                "guidance": (
+                    "The command timed out. Report the timeout and suggest a narrower "
+                    "command or direct file inspection instead of blindly retrying."
+                ),
+            }
+        )
+        return payload
+
+    if result.get("truncated"):
+        payload.update(
+            {
+                "reason": "command_output_truncated",
+                "action": "narrow_scope",
+                "guidance": (
+                    "The command output was truncated. Narrow the command scope or "
+                    "inspect the referenced files directly before continuing."
+                ),
+            }
+        )
+        if obs["ok"]:
+            return payload
+
+    if not obs["ok"]:
+        payload.update(
+            {
+                "reason": "command_failed",
+                "action": "inspect_failure_context",
+                "guidance": _command_follow_up_hint(result),
+            }
+        )
+        return payload
+
+    return payload if payload.get("reason") else None
+
+
+def _build_command_timeout_answer(obs: Observation) -> str:
+    result = cast(dict[str, Any], obs["result"])
+    lines = [
+        "Agent stopped after a command timed out.",
+        f"Command: {result.get('command', '(unknown)')}",
+        f"Working directory: {result.get('cwd', '.')}",
+    ]
+    stdout_preview = _preview_text(result.get("stdout"), limit=400)
+    stderr_preview = _preview_text(result.get("stderr"), limit=400)
+    if stderr_preview is not None:
+        lines.append(f"stderr preview: {stderr_preview}")
+    if stdout_preview is not None:
+        lines.append(f"stdout preview: {stdout_preview}")
+    lines.append(
+        "Suggested next step: rerun a narrower command or inspect the referenced "
+        "files directly with read_file or search_text."
+    )
+    return "\n".join(lines)
+
+
+def _command_summary_lines(observations: list[Observation]) -> list[str]:
+    lines: list[str] = []
+    for index, obs in enumerate(observations, start=1):
+        result = obs.get("result")
+        if obs["tool"] != "run_command" or not isinstance(result, dict):
+            continue
+
+        command = str(result.get("command", "(unknown)"))
+        cwd = str(result.get("cwd", "."))
+        exit_code = result.get("exit_code")
+        if result.get("timed_out"):
+            status = "timed out"
+        elif obs["ok"]:
+            status = f"ok (exit {exit_code})"
+        elif exit_code is not None:
+            status = f"failed (exit {exit_code})"
+        else:
+            status = "failed"
+
+        evidence = _preview_text(result.get("stderr"), limit=180) or _preview_text(
+            result.get("stdout"),
+            limit=180,
+        )
+        line = f"{len(lines) + 1}. {command} [cwd={cwd}] -> {status}"
+        if evidence is not None:
+            line += f" | evidence: {evidence.splitlines()[0]}"
+        lines.append(line)
+    return lines
 
 
 def _summarize_step(message: AIMessage, tool_call: ToolCall | None) -> str:
@@ -362,7 +628,7 @@ def _make_planner(
         )
         raw = llm_with_tools.invoke(request_messages)
         response = _coerce_ai_message(raw)
-        tool_call = _build_tool_call(response, state)
+        tool_call = _build_tool_call(response, state, config)
         assistant_content = _content_to_text(response.content)
         current_step = _summarize_step(response, tool_call)
         plan = _append_plan_step(state["plan"], current_step)
@@ -391,11 +657,7 @@ def _make_planner(
                 run_id,
                 config.log_dir,
                 EVENT_TOOL_PROPOSED,
-                {
-                    "tool": tool_call["name"],
-                    "tool_call_id": tool_call["id"],
-                    "args": tool_call["args"],
-                },
+                _tool_call_audit_payload(tool_call),
                 event_listener,
             )
 
@@ -431,9 +693,7 @@ def _make_policy_guard(
             config.log_dir,
             EVENT_POLICY_DECISION,
             {
-                "tool": tc["name"],
-                "tool_call_id": tc["id"],
-                "args": tc["args"],
+                **_tool_call_audit_payload(tc),
                 "decision": decision,
             },
             event_listener,
@@ -462,6 +722,7 @@ _SKILL_DISPATCH: dict[str, Any] = {
     "list_dir": list_dir,
     "read_file": read_file,
     "search_text": search_text,
+    "run_command": run_command,
 }
 
 
@@ -502,10 +763,13 @@ def _make_tool_executor(
         else:
             try:
                 # Skills: fn(primary_arg, config, **kwargs)
-                # primary arg key: "path" for list_dir/read_file, "query" for search_text
+                # primary arg key: "path" for list_dir/read_file,
+                # "query" for search_text, "command" for run_command
                 extra = dict(tc["args"])
                 if tc["name"] == "search_text":
                     primary = str(extra.pop("query", ""))
+                elif tc["name"] == "run_command":
+                    primary = str(extra.pop("command", ""))
                 else:
                     primary = str(extra.pop("path", "."))
 
@@ -515,7 +779,7 @@ def _make_tool_executor(
                 obs = Observation(
                     tool=tc["name"],
                     ok=ok,
-                    result=result if ok else None,
+                    result=result,
                     error=str(result["error"]) if not ok and result.get("error") else None,
                     duration_ms=duration_ms,
                 )
@@ -542,14 +806,7 @@ def _make_tool_executor(
             state["run_id"],
             config.log_dir,
             EVENT_TOOL_RESULT,
-            {
-                "tool": obs["tool"],
-                "tool_call_id": tc["id"],
-                "ok": obs["ok"],
-                "duration_ms": obs["duration_ms"],
-                "error": obs["error"],
-                "result": obs["result"],
-            },
+            _tool_result_audit_payload(tc, obs),
             event_listener,
         )
 
@@ -582,6 +839,7 @@ def _make_reflector(
 ) -> Callable[[AgentState], dict[str, Any]]:
     def reflector(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
+        last_obs = state["observations"][-1] if state["observations"] else None
 
         # Circuit-breaker: total iteration limit
         if state["iteration_count"] >= config.max_iterations:
@@ -603,6 +861,24 @@ def _make_reflector(
                     f"Last observations:\n{summary}"
                 )
             }
+
+        if last_obs is not None:
+            command_reflection = _command_reflection_payload(last_obs)
+            if command_reflection is not None:
+                _one_shot_audit(
+                    run_id,
+                    config.log_dir,
+                    EVENT_REFLECTOR_ACTION,
+                    command_reflection,
+                    event_listener,
+                )
+                result = last_obs.get("result")
+                if (
+                    last_obs["tool"] == "run_command"
+                    and isinstance(result, dict)
+                    and result.get("timed_out")
+                ):
+                    return {"final_answer": _build_command_timeout_answer(last_obs)}
 
         # Circuit-breaker: consecutive failure limit
         if state["consecutive_failures"] >= config.max_consecutive_failures:
@@ -645,6 +921,9 @@ def _make_finalizer(
 ) -> Callable[[AgentState], dict[str, Any]]:
     def finalizer(state: AgentState) -> dict[str, Any]:
         final = state.get("final_answer") or "(no answer produced)"
+        command_summaries = _command_summary_lines(state["observations"])
+        if command_summaries and "Executed commands:" not in final:
+            final = f"{final}\n\nExecuted commands:\n" + "\n".join(command_summaries)
 
         _one_shot_audit(
             state["run_id"],
@@ -654,6 +933,8 @@ def _make_finalizer(
                 "final_answer": final,
                 "iteration_count": state["iteration_count"],
                 "observation_count": len(state["observations"]),
+                "command_count": len(command_summaries),
+                "command_summaries": command_summaries,
             },
             event_listener,
         )

@@ -59,7 +59,7 @@ from linux_agent.state import AgentState
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="linux-agent",
-        description="Read-only Linux filesystem agent powered by LangGraph.",
+        description="Controlled Linux workspace agent powered by LangGraph.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -128,6 +128,8 @@ def _style(text: str, *codes: str, enabled: bool) -> str:
 def _render_value(value: Any) -> str:
     if value is None:
         return "(none)"
+    if isinstance(value, bool):
+        return "True" if value else "False"
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
@@ -273,6 +275,34 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             if idx != len(messages):
                 print(file=stream)
 
+    def _print_command_fields(data: dict[str, Any]) -> None:
+        _print_field(
+            stream,
+            "Command",
+            data.get("command"),
+            use_color=use_color,
+            inline=True,
+        )
+        _print_field(
+            stream,
+            "Working Directory",
+            data.get("cwd", "."),
+            use_color=use_color,
+            inline=True,
+        )
+        if data.get("argv") is not None:
+            _print_field(stream, "Argv", data.get("argv"), use_color=use_color)
+        if data.get("timeout_seconds") is not None:
+            _print_field(
+                stream,
+                "Timeout",
+                f"{data.get('timeout_seconds')}s",
+                use_color=use_color,
+                inline=True,
+            )
+        if data.get("env_keys"):
+            _print_field(stream, "Env Keys", data.get("env_keys"), use_color=use_color)
+
     def _print_record(record: AuditEvent, iteration: int | None) -> None:
         data = record["data"]
         event = record["event"]
@@ -294,19 +324,43 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                 _print_field(stream, "Final Answer", data.get("final_answer"), use_color=use_color)
         elif event == EVENT_TOOL_PROPOSED:
             _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
+            if data.get("risk_level") is not None:
+                _print_field(stream, "Risk Level", data.get("risk_level"), use_color=use_color, inline=True)
             _print_field(stream, "Call ID", data.get("tool_call_id"), use_color=use_color, inline=True)
-            _print_field(stream, "Args", data.get("args"), use_color=use_color)
+            if data.get("tool") == "run_command":
+                _print_command_fields(data)
+            else:
+                _print_field(stream, "Args", data.get("args"), use_color=use_color)
         elif event == EVENT_POLICY_DECISION:
             _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
             _print_field(stream, "Decision", data.get("decision"), use_color=use_color, inline=True)
+            if data.get("risk_level") is not None:
+                _print_field(stream, "Risk Level", data.get("risk_level"), use_color=use_color, inline=True)
             _print_field(stream, "Call ID", data.get("tool_call_id"), use_color=use_color, inline=True)
-            _print_field(stream, "Args", data.get("args"), use_color=use_color)
+            if data.get("tool") == "run_command":
+                _print_command_fields(data)
+            else:
+                _print_field(stream, "Args", data.get("args"), use_color=use_color)
         elif event == EVENT_TOOL_RESULT:
             status = "ok" if data.get("ok") else "error"
             _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
             _print_field(stream, "Status", status, use_color=use_color, inline=True)
+            if data.get("risk_level") is not None:
+                _print_field(stream, "Risk Level", data.get("risk_level"), use_color=use_color, inline=True)
             _print_field(stream, "Call ID", data.get("tool_call_id"), use_color=use_color, inline=True)
             _print_field(stream, "Duration", f"{data.get('duration_ms', 0)}ms", use_color=use_color, inline=True)
+            if data.get("tool") == "run_command":
+                _print_command_fields(data)
+                if data.get("exit_code") is not None:
+                    _print_field(stream, "Exit Code", data.get("exit_code"), use_color=use_color, inline=True)
+                if data.get("timed_out") is not None:
+                    _print_field(stream, "Timed Out", data.get("timed_out"), use_color=use_color, inline=True)
+                if data.get("truncated") is not None:
+                    _print_field(stream, "Truncated", data.get("truncated"), use_color=use_color, inline=True)
+                if data.get("stderr_preview") is not None:
+                    _print_field(stream, "Stderr", data.get("stderr_preview"), use_color=use_color)
+                if data.get("stdout_preview") is not None:
+                    _print_field(stream, "Stdout", data.get("stdout_preview"), use_color=use_color)
             if data.get("error") is not None:
                 _print_field(stream, "Error", data.get("error"), use_color=use_color)
             _print_field(stream, "Result", data.get("result"), use_color=use_color)
@@ -316,6 +370,10 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         elif event == EVENT_RUN_END:
             _print_field(stream, "Iterations", data.get("iteration_count"), use_color=use_color, inline=True)
             _print_field(stream, "Observations", data.get("observation_count"), use_color=use_color, inline=True)
+            if data.get("command_count") is not None:
+                _print_field(stream, "Commands", data.get("command_count"), use_color=use_color, inline=True)
+            if data.get("command_summaries"):
+                _print_field(stream, "Command Summaries", data.get("command_summaries"), use_color=use_color)
             _print_field(stream, "Final Answer", data.get("final_answer"), use_color=use_color)
         else:
             _print_field(stream, "Data", data, use_color=use_color)
