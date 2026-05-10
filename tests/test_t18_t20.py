@@ -138,6 +138,26 @@ class TestT19CommandPolicy:
             }
         ]
 
+    def test_parse_command_sequence_allows_stdout_redirect(self) -> None:
+        segments = parse_command_sequence("curl -s https://example.com 2>&1 > out.json && wc -c out.json")
+
+        assert segments == [
+            {
+                "operator": None,
+                "argv": ["curl", "-s", "https://example.com"],
+                "command": "curl -s https://example.com 2>&1 > out.json",
+                "stages": [
+                    {
+                        "argv": ["curl", "-s", "https://example.com"],
+                        "command": "curl -s https://example.com 2>&1 > out.json",
+                        "merge_stderr": True,
+                        "stdout_path": "out.json",
+                    }
+                ],
+            },
+            {"operator": "&&", "argv": ["wc", "-c", "out.json"], "command": "wc -c out.json"},
+        ]
+
     def test_parse_command_rejects_shell_control_syntax(self) -> None:
         with pytest.raises(Exception, match="unsupported shell syntax"):
             parse_command("pytest -q > out.txt")
@@ -362,6 +382,19 @@ class TestT19CommandPolicy:
 
         assert evaluate_tool_call(tool_call, config) == "needs_approval"
 
+    def test_evaluate_tool_call_requires_approval_for_run_command_stdout_redirect(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -sL", "wc -c"],
+            command_denylist=["curl"],
+        )
+        tool_call = make_tool_call(
+            "run_command",
+            {"command": "curl -sL --max-time 15 https://example.com > out.json && wc -c out.json", "cwd": "."},
+        )
+
+        assert evaluate_tool_call(tool_call, config) == "needs_approval"
+
     def test_evaluate_tool_call_denies_run_command_file_output_outside_workspace(self, tmp_path: Path) -> None:
         config = make_config(
             tmp_path,
@@ -372,6 +405,20 @@ class TestT19CommandPolicy:
         tool_call = make_tool_call(
             "run_command",
             {"command": f"curl -sL -o {outside_path} --max-time 15 https://example.com 2>&1 && head -c 200 {outside_path}", "cwd": "."},
+        )
+
+        assert evaluate_tool_call(tool_call, config) == "deny"
+
+    def test_evaluate_tool_call_denies_run_command_stdout_redirect_outside_workspace(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -sL", "wc -c"],
+            command_denylist=["curl"],
+        )
+        outside_path = (tmp_path.parent / "outside.json").resolve()
+        tool_call = make_tool_call(
+            "run_command",
+            {"command": f"curl -sL --max-time 15 https://example.com > {outside_path} && wc -c {outside_path}", "cwd": "."},
         )
 
         assert evaluate_tool_call(tool_call, config) == "deny"
@@ -616,6 +663,22 @@ class TestT20RunCommand:
             thread.join(timeout=5)
 
         assert result["ok"] is True
+
+    def test_run_command_supports_stdout_redirect(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["echo", "wc -c"],
+            command_denylist=[],
+            write_requires_approval=False,
+        )
+
+        result = run_command("echo hello > out.txt && wc -c out.txt", config)
+
+        assert result["ok"] is True
+        assert result["exit_code"] == 0
+        assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "hello\n"
+        assert "out.txt" in result["command_segments"][0]["command"]
+        assert "6" in result["stdout"]
 
     @pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed")
     def test_run_command_supports_allowlisted_curl_pipeline_with_stderr_merge(self, tmp_path: Path) -> None:

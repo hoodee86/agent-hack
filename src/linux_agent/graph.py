@@ -198,8 +198,11 @@ All paths and working directories must stay within the workspace root.
 - Before proposing a write, gather enough evidence from read_file/search_text/list_dir to justify the exact change.
 - Limited command chaining with &&, ||, ;, and | is allowed only when each
     segment or pipeline stage is individually safe and allowlisted.
-- Never request redirection, background execution, command substitution,
-    or shell wrappers.
+- Prefer tool-specific output flags such as curl -o over shell redirection.
+- If you must save command stdout, only use > or >> to a workspace-relative path;
+    do not use absolute output paths outside the workspace, and expect file-writing
+    commands to require approval.
+- Never request background execution, command substitution, or shell wrappers.
 - Call at most one tool at a time.
 - If a write tool is required, explain the intended change clearly so the approval summary is useful.
 - After any successful write, you MUST call run_command with a narrow validation command before giving a final answer.

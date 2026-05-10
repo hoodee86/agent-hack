@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import os
+from pathlib import Path
 import subprocess
 import tempfile
 import time
@@ -24,6 +25,7 @@ from linux_agent.policy import (
     filter_command_env,
     parse_command_sequence,
     resolve_command_cwd,
+    resolve_safe_path,
 )
 
 
@@ -63,6 +65,11 @@ def _stage_payload(stage: CommandStage) -> dict[str, Any]:
     }
     if stage.get("merge_stderr"):
         payload["merge_stderr"] = True
+    if stage.get("stdout_path"):
+        payload["stdout_redirect"] = {
+            "path": stage["stdout_path"],
+            "mode": "append" if stage.get("stdout_append") else "overwrite",
+        }
     return payload
 
 
@@ -118,6 +125,28 @@ def _terminate_processes(processes: list[subprocess.Popen[str]]) -> None:
                 proc.kill()
             except OSError:
                 continue
+
+
+def _resolve_stdout_redirect_path(
+    config: AgentConfig,
+    safe_cwd: os.PathLike[str] | str,
+    raw_path: str,
+) -> Path:
+    target = Path(raw_path)
+    if target.is_absolute():
+        return resolve_safe_path(
+            config.workspace_root,
+            raw_path,
+            config.sensitive_path_parts,
+        )
+
+    cwd_path = Path(os.fspath(safe_cwd))
+    relative_cwd = cwd_path.relative_to(config.workspace_root)
+    return resolve_safe_path(
+        config.workspace_root,
+        str(relative_cwd / target),
+        config.sensitive_path_parts,
+    )
 
 
 def run_command(
@@ -182,10 +211,21 @@ def run_command(
 
         if len(stages) == 1:
             stderr_target: int = subprocess.STDOUT if stages[0].get("merge_stderr") else subprocess.PIPE
+            stdout_handle: Any | None = None
+            stdout_target: Any = subprocess.PIPE
             try:
+                if stages[0].get("stdout_path"):
+                    resolved_output = _resolve_stdout_redirect_path(
+                        config,
+                        safe_cwd,
+                        str(stages[0]["stdout_path"]),
+                    )
+                    mode = "a" if stages[0].get("stdout_append") else "w"
+                    stdout_handle = resolved_output.open(mode, encoding="utf-8")
+                    stdout_target = stdout_handle
                 proc = subprocess.run(
                     stages[0]["argv"],
-                    stdout=subprocess.PIPE,
+                    stdout=stdout_target,
                     stderr=stderr_target,
                     text=True,
                     encoding="utf-8",
@@ -239,8 +279,12 @@ def run_command(
                     "command_segments": segment_results,
                     **_result_command_fields(segments),
                 }
+            finally:
+                if stdout_handle is not None:
+                    stdout_handle.close()
 
-            stdout_parts.append(proc.stdout)
+            if proc.stdout is not None:
+                stdout_parts.append(proc.stdout)
             if proc.stderr is not None:
                 stderr_parts.append(proc.stderr)
             last_exit_code = proc.returncode
@@ -252,20 +296,35 @@ def run_command(
         stderr_files: list[Any | None] = []
         processes: list[subprocess.Popen[str]] = []
         previous_stdout: Any = None
+        redirect_handle: Any | None = None
         timed_out_stage_indexes: set[int] = set()
         final_stdout = ""
         try:
-            for stage in stages:
+            for stage_index, stage in enumerate(stages):
                 stderr_file: Any | None = None
                 stderr_target: Any = subprocess.STDOUT if stage.get("merge_stderr") else None
                 if stderr_target is None:
                     stderr_file = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
                     stderr_target = stderr_file
                 stderr_files.append(stderr_file)
+
+                stdout_target: Any = subprocess.PIPE
+                if stage.get("stdout_path"):
+                    if stage_index != len(stages) - 1:
+                        raise OSError("stdout redirection is only supported on the final pipeline stage")
+                    resolved_output = _resolve_stdout_redirect_path(
+                        config,
+                        safe_cwd,
+                        str(stage["stdout_path"]),
+                    )
+                    mode = "a" if stage.get("stdout_append") else "w"
+                    redirect_handle = resolved_output.open(mode, encoding="utf-8")
+                    stdout_target = redirect_handle
+
                 proc = subprocess.Popen(
                     stage["argv"],
                     stdin=previous_stdout,
-                    stdout=subprocess.PIPE,
+                    stdout=stdout_target,
                     stderr=stderr_target,
                     text=True,
                     encoding="utf-8",
@@ -383,6 +442,8 @@ def run_command(
             for handle in stderr_files:
                 if handle is not None:
                     handle.close()
+            if redirect_handle is not None:
+                redirect_handle.close()
 
         stdout_parts.append(_coerce_stream_text(final_stdout))
         stderr_parts.append(stderr_text)

@@ -32,6 +32,7 @@ _RAW_UNSAFE_SHELL_PATTERNS: tuple[str, ...] = (
 )
 _SUPPORTED_SEQUENCE_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";"})
 _SUPPORTED_PIPE_OPERATOR = "|"
+_SUPPORTED_STDOUT_REDIRECT_OPERATORS: frozenset[str] = frozenset({">", ">>"})
 _BINARY_PATH_SUFFIXES: frozenset[str] = frozenset(
     {
         ".7z",
@@ -107,6 +108,8 @@ class CommandStage(TypedDict):
     argv: list[str]
     command: str
     merge_stderr: NotRequired[bool]
+    stdout_path: NotRequired[str]
+    stdout_append: NotRequired[bool]
 
 
 class PolicyAssessment(TypedDict):
@@ -265,7 +268,11 @@ def _tokenize_command(raw: str) -> list[str]:
 
 
 def _is_unsupported_shell_token(token: str) -> bool:
-    if token in _SUPPORTED_SEQUENCE_OPERATORS or token == _SUPPORTED_PIPE_OPERATOR:
+    if (
+        token in _SUPPORTED_SEQUENCE_OPERATORS
+        or token == _SUPPORTED_PIPE_OPERATOR
+        or token in _SUPPORTED_STDOUT_REDIRECT_OPERATORS
+    ):
         return False
     punctuation = set(token)
     if punctuation and punctuation.issubset({"&", "|", ";", ">", "<"}):
@@ -273,7 +280,13 @@ def _is_unsupported_shell_token(token: str) -> bool:
     return False
 
 
-def _build_command_stage(argv: list[str], *, merge_stderr: bool = False) -> CommandStage:
+def _build_command_stage(
+    argv: list[str],
+    *,
+    merge_stderr: bool = False,
+    stdout_path: str | None = None,
+    stdout_append: bool = False,
+) -> CommandStage:
     if not argv:
         raise PolicyViolation("unsupported shell syntax in command")
     stage_argv = list(argv)
@@ -281,6 +294,12 @@ def _build_command_stage(argv: list[str], *, merge_stderr: bool = False) -> Comm
     if merge_stderr:
         stage["merge_stderr"] = True
         stage["command"] = f"{stage['command']} 2>&1"
+    if stdout_path is not None:
+        stage["stdout_path"] = stdout_path
+        if stdout_append:
+            stage["stdout_append"] = True
+        redirect_op = ">>" if stdout_append else ">"
+        stage["command"] = f"{stage['command']} {redirect_op} {shlex.quote(stdout_path)}"
     return stage
 
 
@@ -295,33 +314,42 @@ def parse_command_sequence(raw: str) -> list[CommandSegment]:
     """Parse a command string into sequential command segments.
 
     Supported separators are ``&&``, ``||``, and ``;``. Each segment may also
-    contain a pipeline joined with ``|``. The only supported redirection is
-    ``2>&1`` to merge stderr into stdout for a stage. Other shell features such
-    as subshells and background execution still raise
-    ``PolicyViolation``.
+    contain a pipeline joined with ``|``. Supported redirections are ``2>&1``
+    to merge stderr into stdout for a stage and ``>``/``>>`` to write a stage's
+    stdout to a file. Other shell features such as subshells and background
+    execution still raise ``PolicyViolation``.
     """
     tokens = _tokenize_command(raw)
     segments: list[CommandSegment] = []
     argv: list[str] = []
     stages: list[CommandStage] = []
     merge_stderr = False
+    stdout_path: str | None = None
+    stdout_append = False
     next_operator: Literal["&&", "||", ";"] | None = None
 
     def _flush_segment() -> None:
-        nonlocal argv, stages, merge_stderr
-        stage = _build_command_stage(argv, merge_stderr=merge_stderr)
+        nonlocal argv, stages, merge_stderr, stdout_path, stdout_append
+        stage = _build_command_stage(
+            argv,
+            merge_stderr=merge_stderr,
+            stdout_path=stdout_path,
+            stdout_append=stdout_append,
+        )
         all_stages = [*stages, stage]
         segment = CommandSegment(
             operator=next_operator,
             argv=all_stages[0]["argv"],
             command=" | ".join(item["command"] for item in all_stages),
         )
-        if len(all_stages) > 1:
+        if len(all_stages) > 1 or stage.get("merge_stderr") or stage.get("stdout_path") is not None:
             segment["stages"] = all_stages
         segments.append(segment)
         argv = []
         stages = []
         merge_stderr = False
+        stdout_path = None
+        stdout_append = False
 
     index = 0
     while index < len(tokens):
@@ -341,7 +369,25 @@ def parse_command_sequence(raw: str) -> list[CommandSegment]:
         if _is_unsupported_shell_token(token):
             raise PolicyViolation("unsupported shell syntax in command", path=raw)
 
+        if token in _SUPPORTED_STDOUT_REDIRECT_OPERATORS:
+            if not argv or stdout_path is not None or index + 1 >= len(tokens):
+                raise PolicyViolation("unsupported shell syntax in command", path=raw)
+            target = tokens[index + 1]
+            if (
+                target == _SUPPORTED_PIPE_OPERATOR
+                or target in _SUPPORTED_SEQUENCE_OPERATORS
+                or target in _SUPPORTED_STDOUT_REDIRECT_OPERATORS
+                or _is_unsupported_shell_token(target)
+            ):
+                raise PolicyViolation("unsupported shell syntax in command", path=raw)
+            stdout_path = target
+            stdout_append = token == ">>"
+            index += 2
+            continue
+
         if token == _SUPPORTED_PIPE_OPERATOR:
+            if stdout_path is not None:
+                raise PolicyViolation("unsupported shell syntax in command", path=raw)
             stages.append(_build_command_stage(argv, merge_stderr=merge_stderr))
             argv = []
             merge_stderr = False
@@ -369,7 +415,13 @@ def parse_command_sequence(raw: str) -> list[CommandSegment]:
 def parse_command(raw: str) -> list[str]:
     """Parse a single command argv and reject shell control syntax."""
     segments = parse_command_sequence(raw)
-    if len(segments) != 1 or len(command_segment_stages(segments[0])) != 1:
+    stages = command_segment_stages(segments[0]) if len(segments) == 1 else []
+    if (
+        len(segments) != 1
+        or len(stages) != 1
+        or stages[0].get("merge_stderr")
+        or stages[0].get("stdout_path") is not None
+    ):
         raise PolicyViolation("unsupported shell syntax in command", path=raw)
     return segments[0]["argv"]
 
@@ -1016,6 +1068,13 @@ def _extract_curl_output_targets(argv: list[str]) -> tuple[list[str], bool]:
     return targets, writes_to_cwd
 
 
+def _extract_redirect_output_target(stage: CommandStage) -> str | None:
+    target = stage.get("stdout_path")
+    if not isinstance(target, str) or not target.strip():
+        return None
+    return target
+
+
 def _assess_run_command_write_effects(
     tool_call: "ToolCall",
     config: "AgentConfig",
@@ -1033,6 +1092,9 @@ def _assess_run_command_write_effects(
     for segment in segments:
         for stage in command_segment_stages(segment):
             output_targets, writes_to_cwd = _extract_curl_output_targets(stage["argv"])
+            redirect_target = _extract_redirect_output_target(stage)
+            if redirect_target is not None:
+                output_targets = [*output_targets, redirect_target]
             for raw_path in output_targets:
                 try:
                     resolved = _resolve_command_output_path(config, raw_path, cwd=cwd)
