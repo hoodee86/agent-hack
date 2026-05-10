@@ -493,6 +493,8 @@ linux-agent/
 
 验收标准：Agent 可以在有限预算内完成简单开发任务，并在风险升高时暂停。
 
+> 阶段 4 的详细任务拆解见 `docs/phase4_detailed_tasks.md`。
+
 ## 11. LangGraph 伪代码
 
 ```python
