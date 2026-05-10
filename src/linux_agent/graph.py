@@ -22,7 +22,7 @@ Graph topology
 
     planner      → finalizer   when final_answer is set
         policy_guard → approval_pause when risk_decision is "needs_approval"
-        policy_guard → finalizer   when risk_decision is "deny"
+        policy_guard → reflector   when risk_decision is "deny"
     reflector    → finalizer   when circuit-breaker trips
         approval_pause → finalizer after persisting the pending approval snapshot
     finalizer    → END
@@ -324,7 +324,94 @@ def _preview_text(value: Any, *, limit: int = 320) -> str | None:
     return clipped
 
 
+def _policy_denial_follow_up_hint(tool_call: ToolCall, reason: str | None) -> str | None:
+    reason_text = (reason or "").lower()
+    tool_name = tool_call["name"]
+
+    if tool_name == "run_command":
+        if "path escapes workspace root" in reason_text:
+            return (
+                "Retry with cwd='.' and a workspace-relative path in the current folder "
+                "instead of an absolute path outside the workspace."
+            )
+        if "allowed working directories" in reason_text:
+            return "Retry with cwd='.' or another configured workspace-relative directory."
+        if "unsupported shell syntax" in reason_text:
+            return (
+                "Rewrite the command using supported syntax only; prefer tool-specific output "
+                "flags such as curl -o, or use > / >> only with workspace-relative paths."
+            )
+        return (
+            "Use a lower-risk allowlisted command or inspect the referenced files directly "
+            "before retrying."
+        )
+
+    if tool_name in {"read_file", "list_dir", "search_text", "write_file", "apply_patch"}:
+        if "path escapes workspace root" in reason_text or "sensitive component" in reason_text:
+            return "Retry with a workspace-relative path inside the current folder."
+
+    return None
+
+
+def _policy_denied_result(tool_call: ToolCall, reason: str | None) -> dict[str, Any]:
+    hint = _policy_denial_follow_up_hint(tool_call, reason)
+    args = tool_call["args"]
+    error_text = reason or "operation denied by security policy"
+
+    if tool_call["name"] == "run_command":
+        result: dict[str, Any] = {
+            **_command_fields_from_args(args),
+            "exit_code": None,
+            "stdout": "",
+            "stderr": error_text,
+            "timed_out": False,
+            "truncated": False,
+            "error": error_text,
+        }
+    elif tool_call["name"] == "read_file":
+        result = {
+            "path": str(args.get("path", ".")),
+            "start_line": args.get("start_line", 1),
+            "end_line": args.get("end_line"),
+            "error": error_text,
+        }
+    elif tool_call["name"] == "list_dir":
+        result = {
+            "path": str(args.get("path", ".")),
+            "recursive": bool(args.get("recursive", False)),
+            "error": error_text,
+        }
+    elif tool_call["name"] == "search_text":
+        result = {
+            "query": str(args.get("query", "")),
+            "path": str(args.get("path", ".")),
+            "glob": str(args.get("glob", "**/*")),
+            "error": error_text,
+        }
+    elif tool_call["name"] == "write_file":
+        result = {
+            "path": str(args.get("path", ".")),
+            "mode": str(args.get("mode", "overwrite")),
+            "error": error_text,
+        }
+    elif tool_call["name"] == "apply_patch":
+        result = {
+            "diff_preview": _preview_text(args.get("patch", args.get("diff")), limit=800),
+            "error": error_text,
+        }
+    else:
+        result = {"error": error_text}
+
+    if hint is not None:
+        result["follow_up_hint"] = hint
+    return result
+
+
 def _command_follow_up_hint(result: dict[str, Any]) -> str:
+    explicit_hint = result.get("follow_up_hint")
+    if isinstance(explicit_hint, str) and explicit_hint.strip():
+        return explicit_hint
+
     command = str(result.get("command", "")).lower()
     if "pytest" in command:
         return (
@@ -2067,6 +2154,8 @@ def _make_planner(
             "budget_stop_reason": budget_stop_reason,
             "recovery_attempt_total": _effective_recovery_attempt_total(state),
             "recovery_state": updated_recovery_state,
+            "risk_decision": None,
+            "pending_approval": None,
             "proposed_tool_call": None if budget_stop_reason is not None else tool_call,
             "final_answer": final_answer,
         }
@@ -2116,18 +2205,39 @@ def _make_policy_guard(
         )
 
         if decision == "deny":
+            denial_reason = cast(str | None, assessment.get("reason"))
+            obs = Observation(
+                tool=tc["name"],
+                ok=False,
+                result=_policy_denied_result(tc, denial_reason),
+                error=(
+                    f"Operation denied by security policy: tool '{tc['name']}' with args {tc['args']} is not permitted."
+                    + (f" Reason: {denial_reason}." if denial_reason is not None else "")
+                ),
+                duration_ms=0,
+            )
+            _one_shot_audit(
+                state["run_id"],
+                config.log_dir,
+                EVENT_TOOL_RESULT,
+                _tool_result_audit_payload(tc, obs),
+                event_listener,
+            )
             return {
                 "risk_decision": "deny",
                 "pending_approval": None,
-                "final_answer": (
-                    f"Operation denied by security policy: "
-                    f"tool '{tc['name']}' with args {tc['args']} is not permitted."
-                    + (
-                        f" Reason: {assessment['reason']}."
-                        if assessment["reason"] is not None
-                        else ""
+                "messages": [
+                    ToolMessage(
+                        content=_serialize_tool_payload(obs),
+                        tool_call_id=tc["id"],
                     )
-                ),
+                ],
+                "observations": state["observations"] + [obs],
+                "iteration_count": state["iteration_count"] + 1,
+                "command_count": _effective_command_count(state) + (1 if tc["name"] == "run_command" else 0),
+                "consecutive_failures": state["consecutive_failures"] + 1,
+                "proposed_tool_call": None,
+                "final_answer": None,
             }
 
         if decision == "needs_approval" and approval_request is not None:
@@ -3095,7 +3205,7 @@ def _route_policy_guard(state: AgentState) -> str:
     if state.get("risk_decision") == "needs_approval":
         return "approval_pause"
     if state.get("risk_decision") == "deny":
-        return "finalizer"
+        return "reflector"
     return "tool_executor"
 
 
@@ -3218,7 +3328,7 @@ def build_graph(
         {
             "tool_executor": "tool_executor",
             "approval_pause": "approval_pause",
-            "finalizer": "finalizer",
+            "reflector": "reflector",
         },
     )
     graph.add_edge("approval_pause", "finalizer")

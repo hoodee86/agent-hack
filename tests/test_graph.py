@@ -414,20 +414,61 @@ class TestGraphHappyPath:
 
 class TestGraphSecurityBlocking:
     def test_path_traversal_denied(self, tmp_path: Path) -> None:
-        """PolicyGuard denies a path-traversal tool call."""
+        """PolicyGuard denial is surfaced as a failed observation so Planner can recover."""
         cfg = _make_config(tmp_path)
         llm = _stub_llm(
             _tool_turn(
                 "read_file",
                 {"path": "../../../etc/passwd"},
                 content="Reading /etc/passwd",
-            )
+            ),
+            _final_turn("Stopped after the policy denial and stayed inside the workspace."),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Read /etc/passwd", str(tmp_path)))
-        assert result["risk_decision"] == "deny"
-        assert "denied" in (result["final_answer"] or "").lower()
-        assert result["iteration_count"] == 0  # ToolExecutor never ran
+        assert result["risk_decision"] is None
+        assert result["iteration_count"] == 1
+        assert len(result["observations"]) == 1
+        assert result["observations"][0]["tool"] == "read_file"
+        assert result["observations"][0]["ok"] is False
+        assert "path escapes workspace root" in (result["observations"][0]["error"] or "")
+        assert "stayed inside the workspace" in (result["final_answer"] or "")
+
+    def test_run_command_policy_denial_can_recover_to_relative_path(self, tmp_path: Path) -> None:
+        """A denied run_command should loop back so Planner can retry with a workspace-relative path."""
+        outside_path = (tmp_path.parent / "outside.txt").resolve()
+        cfg = _make_config(
+            tmp_path,
+            command_allowlist=["echo", "wc -c"],
+            command_denylist=[],
+            write_requires_approval=False,
+        )
+        llm = _stub_llm(
+            _tool_turn(
+                "run_command",
+                {"command": f"echo hello > {outside_path} && wc -c {outside_path}", "cwd": "."},
+                content="Writing to an absolute path first",
+            ),
+            _tool_turn(
+                "run_command",
+                {"command": "echo hello > out.txt && wc -c out.txt", "cwd": "."},
+                content="Retrying with a workspace-relative path",
+            ),
+            _final_turn("Saved the summary in out.txt inside the current folder."),
+        )
+        app = build_graph(cfg, chat_model=llm)
+
+        result = app.invoke(_initial_state("Save output in the current folder", str(tmp_path)))
+
+        assert len(result["observations"]) == 2
+        assert result["observations"][0]["tool"] == "run_command"
+        assert result["observations"][0]["ok"] is False
+        assert "path escapes workspace root" in (result["observations"][0]["error"] or "")
+        assert result["observations"][1]["tool"] == "run_command"
+        assert result["observations"][1]["ok"] is True
+        assert result["iteration_count"] == 2
+        assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "hello\n"
+        assert "out.txt inside the current folder" in (result["final_answer"] or "")
 
     def test_write_tool_requires_approval(self, tmp_path: Path) -> None:
         """PolicyGuard pauses write tools for approval instead of executing them."""

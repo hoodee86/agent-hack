@@ -373,26 +373,30 @@ class TestScenarioRunCommand:
 
 class TestScenarioSecurityBlock:
     def test_path_traversal_blocked_no_tool_execution(self, tmp_path: Path) -> None:
-        """The agent must NOT execute any tool when PolicyGuard denies."""
+        """PolicyGuard denial should be recoverable instead of ending the run immediately."""
         cfg = _make_config(tmp_path)
         llm = _stub(
             _tool_turn(
                 "read_file",
                 {"path": "../../../../etc/passwd"},
                 content="Reading /etc/passwd",
-            )
+            ),
+            _final_turn("Stopped after the policy denial."),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Read /etc/passwd", str(tmp_path)))
 
-        assert result["risk_decision"] == "deny"
-        assert result["iteration_count"] == 0   # ToolExecutor never ran
-        assert result["observations"] == []
+        assert result["risk_decision"] is None
+        assert result["iteration_count"] == 1
+        assert len(result["observations"]) == 1
+        assert result["observations"][0]["tool"] == "read_file"
+        assert result["observations"][0]["ok"] is False
+        assert "path escapes workspace root" in (result["observations"][0]["error"] or "")
         assert result["final_answer"] is not None
-        assert "denied" in (result["final_answer"] or "").lower()
+        assert "policy denial" in (result["final_answer"] or "").lower()
 
     def test_sensitive_path_blocked(self, tmp_path: Path) -> None:
-        """Paths hitting sensitive_path_parts (.ssh) are denied by PolicyGuard."""
+        """Sensitive-path denials are also surfaced as failed observations for replanning."""
         (tmp_path / ".ssh").mkdir()
         (tmp_path / ".ssh" / "id_rsa").write_text("fake key")
         cfg = _make_config(tmp_path)
@@ -401,13 +405,16 @@ class TestScenarioSecurityBlock:
                 "read_file",
                 {"path": ".ssh/id_rsa"},
                 content="Reading .ssh/id_rsa",
-            )
+            ),
+            _final_turn("Stopped after the sensitive-path denial."),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Read SSH key", str(tmp_path)))
 
-        assert result["risk_decision"] == "deny"
-        assert result["observations"] == []
+        assert result["risk_decision"] is None
+        assert len(result["observations"]) == 1
+        assert result["observations"][0]["ok"] is False
+        assert "sensitive component" in (result["observations"][0]["error"] or "")
 
     def test_write_tool_blocked(self, tmp_path: Path) -> None:
         """A write tool now stops for approval without any tool execution."""

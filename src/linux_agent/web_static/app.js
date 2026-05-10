@@ -63,6 +63,65 @@ function formatRelativeTime(value) {
   return '刚刚';
 }
 
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'absolute';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  textarea.remove();
+}
+
+function renderDetailBlock(label, value) {
+  return `
+    <div class="detail-block">
+      <div class="detail-header">
+        <p class="detail-label">${escapeHtml(label)}</p>
+        <button type="button" class="copy-button">复制</button>
+      </div>
+      <pre class="detail-body">${escapeHtml(value)}</pre>
+    </div>
+  `;
+}
+
+function handleCopyButtonClick(event) {
+  const button = event.target.closest('.copy-button');
+  if (!button) {
+    return;
+  }
+
+  const detailBlock = button.closest('.detail-block');
+  const content = detailBlock?.querySelector('.detail-body, .code-block')?.textContent;
+  if (!content) {
+    return;
+  }
+
+  copyText(content)
+    .then(() => {
+      button.textContent = '已复制';
+      button.classList.add('copied');
+      window.setTimeout(() => {
+        button.textContent = '复制';
+        button.classList.remove('copied');
+      }, 1400);
+    })
+    .catch((error) => {
+      console.error('Failed to copy text:', error);
+      button.textContent = '复制失败';
+      window.setTimeout(() => {
+        button.textContent = '复制';
+      }, 1400);
+    });
+}
+
 const state = {
   runs: [],
   selectedRunId: null,
@@ -296,18 +355,8 @@ function renderSummary() {
         <dd>${summary.approval_pending ? 'Yes' : 'No'}</dd>
       </div>
     </div>
-    ${finalAnswer ? `
-      <div class="detail-block">
-        <p class="detail-label">Final Answer</p>
-        <pre class="detail-body">${escapeHtml(finalAnswer)}</pre>
-      </div>
-    ` : ''}
-    ${summary.error ? `
-      <div class="detail-block">
-        <p class="detail-label">Background Error</p>
-        <pre class="detail-body">${escapeHtml(summary.error)}</pre>
-      </div>
-    ` : ''}
+    ${finalAnswer ? renderDetailBlock('Final Answer', finalAnswer) : ''}
+    ${summary.error ? renderDetailBlock('Background Error', summary.error) : ''}
   `;
 }
 
@@ -353,14 +402,8 @@ function renderInspector() {
   elements.selectedEventLabel.textContent = event.type;
 
   let detailsHtml = `
-    <div class="detail-block">
-      <p class="detail-label">Event</p>
-      <pre class="detail-body">${escapeHtml(event.type)}</pre>
-    </div>
-    <div class="detail-block">
-      <p class="detail-label">Timestamp</p>
-      <pre class="detail-body">${escapeHtml(formatDate(event.timestamp))}</pre>
-    </div>
+    ${renderDetailBlock('Event', event.type)}
+    ${renderDetailBlock('Timestamp', formatDate(event.timestamp))}
   `;
   
   if (event.details) {
@@ -369,12 +412,7 @@ function renderInspector() {
       if (typeof value === 'object') {
         displayValue = JSON.stringify(value, null, 2);
       }
-      detailsHtml += `
-        <div class="detail-block">
-          <p class="detail-label">${escapeHtml(key)}</p>
-          <pre class="detail-body">${escapeHtml(displayValue)}</pre>
-        </div>
-      `;
+      detailsHtml += renderDetailBlock(key, displayValue);
     });
   } else {
       detailsHtml = '<div class="empty-state">无详细负载内容</div>';
@@ -471,6 +509,7 @@ elements.runForm.addEventListener('submit', async (e) => {
 });
 
 elements.refreshButton.addEventListener('click', fetchRuns);
+document.addEventListener('click', handleCopyButtonClick);
 
 setInterval(checkHealth, 10000);
 if (state.selectedRunId) {
