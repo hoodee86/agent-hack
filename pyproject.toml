@@ -4,16 +4,19 @@ version = "0.1.0"
 description = "A read-only Linux Agent prototype built with LangGraph"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.115",
     "langgraph==1.1.10",
     "langchain==1.2.18",
     "langchain-core==1.3.3",
     "langchain-openai==1.2.1",
     "pydantic>=2.0",
     "PyYAML>=6.0",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
 linux-agent = "linux_agent.app:main"
+linux-agent-web = "linux_agent.web:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -21,9 +24,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/linux_agent"]
+include = ["src/linux_agent/web_static/**"]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.27",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "mypy>=1.10",

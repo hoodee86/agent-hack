@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Linux Agent Console</title>
+    <link rel="stylesheet" href="/static/styles.css?v=3" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="logo-area">
+          <h1>Agent Web Console</h1>
+          <span class="health-chip" id="health-chip">Connecting…</span>
+        </div>
+      </header>
+
+      <div class="app-body">
+        <aside class="app-sidebar">
+          <div class="sidebar-header">
+            <h2>Run History</h2>
+            <button id="refresh-button" type="button" class="btn-icon">↻</button>
+          </div>
+          <div id="run-list" class="run-list"></div>
+        </aside>
+
+        <main class="app-main">
+          <!-- Composer (Top) -->
+          <section class="composer card">
+            <form id="run-form">
+              <div class="composer-inputs">
+                <label>
+                  <span>Goal</span>
+                  <input id="goal-input" type="text" placeholder="e.g. 运行测试并分析报错原因" autocomplete="off" />
+                </label>
+                <label class="workspace-field">
+                  <span>Workspace Override</span>
+                  <input id="workspace-input" type="text" placeholder="Leave empty for config default" autocomplete="off" />
+                </label>
+              </div>
+              <button id="run-submit" type="submit" class="btn-primary">Start Run</button>
+            </form>
+          </section>
+
+          <!-- Summary Status -->
+          <section class="summary card" id="summary-card">
+            <!-- Handled by app.js -->
+          </section>
+
+          <!-- Human Approval Alert (appears when needed) -->
+          <section id="approval-card" class="approval-hidden"></section>
+
+          <!-- Deep Dive Split View -->
+          <div class="exploration-view">
+            <section class="timeline card">
+              <div class="panel-heading">
+                <h2>Execution Timeline</h2>
+                <span id="timeline-count" class="badge">0</span>
+              </div>
+              <div id="timeline" class="timeline-list"></div>
+            </section>
+
+            <section class="inspector-card card">
+              <div class="panel-heading">
+                <h2>Event Inspector</h2>
+                <span id="selected-event-label" class="badge">None</span>
+              </div>
+              <div id="event-inspector" class="event-inspector"></div>
+            </section>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <script type="module" src="/static/app.js?v=7"></script>
+  </body>
+</html>
