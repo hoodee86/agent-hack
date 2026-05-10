@@ -50,6 +50,19 @@ def _normalize_affected_files(request: dict[str, Any]) -> list[str]:
     return []
 
 
+def _sanitized_args(request: dict[str, Any]) -> dict[str, Any]:
+    args = dict(cast(dict[str, Any], request.get("args") or {}))
+    tool = str(request.get("tool", ""))
+    if tool == "write_file" and "content" in args:
+        args["content"] = "(omitted; see diff_preview)"
+    if tool == "apply_patch":
+        if "patch" in args:
+            args["patch"] = "(omitted; see diff_preview)"
+        if "diff" in args:
+            args["diff"] = "(omitted; see diff_preview)"
+    return args
+
+
 def _tool_summary(request: dict[str, Any]) -> str:
     tool = str(request.get("tool", "(unknown)"))
     affected_files = _normalize_affected_files(request)
@@ -130,7 +143,7 @@ def build_approval_view(
         "tool": str(request.get("tool", "")),
         "tool_summary": _tool_summary(request),
         "risk_level": request.get("risk_level"),
-        "args": cast(dict[str, Any], request.get("args") or {}),
+        "args": _sanitized_args(request),
         "reason": str(request.get("reason", "")),
         "impact_summary": str(request.get("impact_summary", "")),
         "affected_files": affected_files,

@@ -37,6 +37,20 @@
 - `graph.py` 已支持写后必须验证的 Planner / Reflector 闭环；验证失败时可自动回滚，并在 finalizer 中总结验证与回滚结果。
 - 当前仍未实现：更复杂的多轮修复策略、验证命令自动推荐优化，以及更细粒度的回滚策略选择。
 
+### 1.3 当前阶段 4 已落地能力（2026-05-10）
+
+- `AgentState` 已扩展 `plan_steps`、`plan_version`、`plan_revision_count`、`last_reflection`、`recovery_state`、`recovery_attempt_total`、`budget_status`、`budget_stop_reason` 等结构化字段。
+- Planner 已具备计划修订与预算感知；prompt 中会显式看到剩余命令、运行时长、计划修订和恢复次数预算。
+- Reflector 已支持结构化 reflection score、`continue/retry/replan/stop` 决策，以及基于失败指纹的有界恢复状态机。
+- 审计日志已新增 `plan_revised`、`reflection_scored`、`recovery_attempted`、`recovery_exhausted`、`recovery_cleared`、`budget_warning`、`budget_exhausted`、`approval_presented`、`approval_response` 等阶段 4 关键事件；`run_end` 也会写入预算使用与恢复统计。
+- CLI 已支持更完整的审批视图、`--show-pending-run <run_id>` 复查、以及 `--decision-note` 记录批准备注或拒绝原因。
+
+当前明确不在阶段 4 范围内：
+
+- 无界自动修复或无限重试。
+- 多 Agent 自协作。
+- 完整产品化 Web UI。
+
 ## 2. 范围与非目标
 
 ### 2.1 范围
@@ -486,14 +500,16 @@ linux-agent/
 
 ### 阶段 4：增强自主性
 
-- 引入计划更新和反思评分。
-- 支持连续错误恢复。
-- 支持任务预算：最大迭代次数、最大命令次数、最大运行时长。
-- 支持更丰富的审批 UI。
+- 已实现结构化计划更新、reflection score 与独立阶段 4 审计事件。
+- 已实现基于失败指纹的有界恢复，以及恢复次数硬限制。
+- 已实现任务预算：最大迭代次数、最大命令次数、最大运行时长、最大计划修订次数、最大恢复尝试次数。
+- 已实现更丰富的审批 UI，包括 pending run 复查与审批响应备注。
 
-验收标准：Agent 可以在有限预算内完成简单开发任务，并在风险升高时暂停。
+验收标准：Agent 可以在有限预算内完成简单开发任务，在失败后做有限次恢复，并在预算耗尽或风险升高时安全暂停/停止。
 
-> 阶段 4 的详细任务拆解见 `docs/phase4_detailed_tasks.md`。
+阶段 4 当前边界：强调有界自主性和清晰可审计的停止语义，不追求无界自修复或更高权限。
+
+> 阶段 4 的详细任务拆解见 `docs/phase4_detailed_tasks.md`，手工验收演练见 `docs/phase4_manual_acceptance.md`。
 
 ## 11. LangGraph 伪代码
 
@@ -593,6 +609,14 @@ def classify_command(command: str) -> str:
 ```yaml
 workspace_root: /workspace
 max_iterations: 12
+max_command_count: 8
+max_runtime_seconds: 900
+max_plan_revisions: 3
+max_recovery_attempts_per_issue: 2
+budget_warning_ratio: 0.8
+reflection_replan_threshold: 60
+reflection_stop_threshold: 30
+approval_ui_mode: detailed
 default_timeout_seconds: 60
 max_output_bytes: 65536
 network_enabled: false
@@ -642,6 +666,8 @@ paths:
 - Agent 能运行允许的测试命令并解析失败输出。
 - 写操作在未审批时暂停。
 - 审批通过后写入文件并记录 diff。
+- 可通过 `--show-pending-run` 复查待审批 run 的风险、diff、预算和回滚信息。
+- 连续同类失败会在恢复预算耗尽时安全停止，并保留 reflection / recovery 摘要。
 
 ### 安全回归测试
 
@@ -649,6 +675,7 @@ paths:
 - 执行 `sudo` 应拒绝。
 - 执行 `rm -rf /` 应拒绝。
 - 使用 symlink 绕过 workspace 应拒绝。
+- 审批 UI 和 `budget_warning` 事件不能泄露被裁剪掉的长内容尾部。
 
 ## 15. 风险与缓解
 

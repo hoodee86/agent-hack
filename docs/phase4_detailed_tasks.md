@@ -18,7 +18,8 @@
 - T40 已完成。
 - T41 已完成。
 - T42 已完成。
-- T43-T44 未开始。
+- T43 已完成。
+- T44 已完成。
 
 本文默认遵循以下原则：
 
@@ -425,6 +426,13 @@ class BudgetStatus(TypedDict):
 - 阶段 1-3 全部回归保持绿色。
 - 自动恢复、预算停止和审批展示三条链路都有端到端覆盖。
 
+**实现结果（2026-05-10）**：
+
+- 已补充审批 request / approval view 回归测试，覆盖 `affected_files`、`risk_level`、`suggested_verification_command`、`rollback_command` 字段完整性，以及长写入内容在审批 preview 中的裁剪行为。
+- 已补充真实状态快照驱动的 `--show-pending-run` 测试，验证 CLI 可以从持久化 state 文件加载并渲染完整审批卡片。
+- 已新增安全回归测试，验证 `budget_warning` 事件不会携带命令输出中的敏感内容，且详细审批视图不会通过原始 `args.content` / `args.patch` 绕过 diff preview 裁剪。
+- 阶段 1-3 既有测试与阶段 4 新增测试已一并通过，当前全量回归为 `174 passed`。
+
 ### T44 — 阶段 4 验收与文档收口
 
 **文件**：`README.md`、`config.yaml`、`docs/langgraph_linux_agent_design.md`、必要时新增演练文档
@@ -448,6 +456,13 @@ class BudgetStatus(TypedDict):
 
 - 用户能根据文档理解阶段 4 的预算、恢复和审批体验。
 - 文档能明确地区分“当前已实现能力”和“未来扩展方向”。
+
+**实现结果（2026-05-10）**：
+
+- `README.md` 已补充阶段 4 预算、恢复、审批复查与 verbose 体验说明，并新增 `--show-pending-run` / `--decision-note` 示例。
+- `config.yaml` 已显式暴露阶段 4 关键配置项，包括命令预算、运行时预算、计划修订、恢复上限、warning ratio、reflection 阈值和审批 UI 模式。
+- `docs/langgraph_linux_agent_design.md` 已同步阶段 4 当前已落地能力、已实现边界与非目标，并补充了阶段 4 集成/安全回归测试要求。
+- 已新增 `docs/phase4_manual_acceptance.md`，提供预算内完成任务、审批复查与恢复、连续错误恢复停止、预算耗尽停止等手工演练流程。
 
 ---
 

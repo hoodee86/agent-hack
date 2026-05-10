@@ -13,6 +13,8 @@
 - 命令失败后的继续诊断：可先跑 `pytest` / `mypy`，再读取相关文件继续总结
 - 审批暂停 / 恢复、写操作审计、备份 manifest 与按 run id 回滚
 - 写后强制验证，以及验证失败时的自动回滚摘要
+- 结构化计划更新、reflection score、有界恢复状态与预算硬熔断
+- 更完整的审批卡片、`--show-pending-run` 复查，以及带备注的审批响应
 
 ## 快速开始
 
@@ -47,9 +49,13 @@ uv run python -m linux_agent --config config.yaml --verbose --show-prompts "READ
 # 当写操作需要审批时，CLI 会以退出码 2 结束，并输出 resume 指令
 uv run python -m linux_agent --config config.yaml "请修改 README 中的示例命令"
 
-# 批准或拒绝某个暂停的 run
+# 重新查看某个 pending run 的审批详情
+uv run python -m linux_agent --config config.yaml --show-pending-run <run_id>
+
+# 批准或拒绝某个暂停的 run，并可记录审批备注
 uv run python -m linux_agent --config config.yaml --resume-run <run_id> --approve
-uv run python -m linux_agent --config config.yaml --resume-run <run_id> --reject
+uv run python -m linux_agent --config config.yaml --resume-run <run_id> --approve --decision-note "验证范围足够窄"
+uv run python -m linux_agent --config config.yaml --resume-run <run_id> --reject --decision-note "diff 过大，需要缩小改动面"
 
 # 按 run id 回滚之前的写操作
 uv run python -m linux_agent --config config.yaml --rollback-run <run_id>
@@ -100,6 +106,25 @@ Command Summaries:
 - `--verbose` 下会额外看到 `approval_requested`、`write_applied`、`write_rollback`、验证状态、验证命令和 rollback 结果。
 
 一次完整的阶段 3 流程通常是：读取上下文 -> 提出 `apply_patch` / `write_file` -> CLI 暂停等待审批 -> `--resume-run <run_id> --approve` -> 自动执行写入 -> 自动要求验证命令 -> 根据验证结果总结完成或回滚。
+
+## 阶段 4：预算、恢复与审批体验
+
+- `config.yaml` 现在可以显式配置 `max_command_count`、`max_runtime_seconds`、`max_plan_revisions`、`max_recovery_attempts_per_issue`、`budget_warning_ratio`、`reflection_replan_threshold`、`reflection_stop_threshold`、`approval_ui_mode`。
+- Planner 会看到剩余预算；当命令数、运行时长、计划修订次数或恢复次数逼近阈值时，运行中会先发 `budget_warning`，彻底耗尽后会安全停止并在最终回答中总结当前进度与阻塞点。
+- Reflector 会把每次 observation 归纳成 `last_reflection` 和 `recovery_state`，支持 `continue`、`retry`、`replan`、`stop` 四类有界后续动作。
+- `--verbose` 下，控制台会额外打印 `plan_revised`、`reflection_scored`、`recovery_attempted`、`recovery_exhausted`、`budget_warning`、`budget_exhausted`、`approval_presented`、`approval_response` 等阶段 4 事件。
+- 审批暂停后，除了直接 approve / reject，还可以通过 `--show-pending-run <run_id>` 复查风险等级、影响文件、diff 预览、回滚命令、建议验证命令、剩余预算和当前恢复状态。
+
+常见停止语义：
+
+- 命令预算耗尽：不会再执行新的命令，会在最终回答里说明已完成步骤、阻塞点和预算原因。
+- 运行时长耗尽：会直接结束当前 run，并保留预算快照与最后一次 reflection。
+- 恢复次数耗尽：同一失败指纹不会无限重试，最终会以 `max_recovery_attempts` 停止。
+
+## 手工验收
+
+- 手工验收流程见 [docs/phase4_manual_acceptance.md](docs/phase4_manual_acceptance.md)。
+- 建议至少演练 3 条链路：预算内完成任务、审批复查与恢复、连续错误恢复后安全停止。
 
 ## 开发
 

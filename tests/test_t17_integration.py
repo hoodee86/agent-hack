@@ -567,3 +567,26 @@ class TestScenarioAuditLog:
         assert "ts" in tr
         assert "ok" in tr["data"]
         assert tr["data"]["tool"] == "read_file"
+
+    def test_budget_warning_event_does_not_leak_command_output(self, tmp_path: Path) -> None:
+        secret = "VERY_SENSITIVE_TOKEN_DO_NOT_EMIT_IN_BUDGET_WARNING"
+        (tmp_path / "secret.txt").write_text(secret + "\n", encoding="utf-8")
+        cfg = _make_config(tmp_path, log_dir=tmp_path / "logs", max_command_count=1)
+        events: list[dict[str, Any]] = []
+        llm = _stub(
+            _tool_turn(
+                "run_command",
+                {"command": f"rg {secret} secret.txt", "cwd": "."},
+                content="Search the file first",
+            ),
+            _final_turn("Stop after checking the budget state."),
+        )
+        app = build_graph(cfg, chat_model=llm, event_listener=events.append)
+
+        result = app.invoke(_initial_state("Search for a token", str(tmp_path)))
+
+        assert result["command_count"] == 1
+        budget_warning = next(event for event in events if event["event"] == "budget_warning")
+        warning_text = json.dumps(budget_warning["data"], ensure_ascii=False)
+        assert secret not in warning_text
+        assert budget_warning["data"]["dimensions"] == ["max_command_count"]

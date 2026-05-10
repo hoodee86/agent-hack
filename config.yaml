@@ -3,57 +3,65 @@ max_iterations: 12
 max_read_bytes: 65536
 max_search_results: 100
 max_list_entries: 200
+max_command_count: 8
+max_runtime_seconds: 900
+max_plan_revisions: 3
+max_recovery_attempts_per_issue: 2
+budget_warning_ratio: 0.8
+reflection_replan_threshold: 60
+reflection_stop_threshold: 30
+approval_ui_mode: detailed
 default_timeout_seconds: 120
 max_output_bytes: 65536
 max_stderr_bytes: 32768
 command_allowlist:
-	- uv run pytest
-	- uv run mypy
-	- uv run ruff
-	- pytest
-	- python -m pytest
-	- mypy
-	- python -m mypy
-	- ruff
-	- python -m ruff
-	- git status
-	- git diff
-	- git --no-pager diff
-	- ls
-	- pwd
-	- find
-	- rg
+  - uv run pytest
+  - uv run mypy
+  - uv run ruff
+  - pytest
+  - python -m pytest
+  - mypy
+  - python -m mypy
+  - ruff
+  - python -m ruff
+  - git status
+  - git diff
+  - git --no-pager diff
+  - ls
+  - pwd
+  - find
+  - rg
 command_denylist:
-	- sudo
-	- su
-	- sh -c
-	- bash -c
-	- zsh -c
-	- python -c
-	- python3 -c
-	- rm
-	- mv
-	- chmod
-	- chown
-	- curl
-	- wget
-	- ssh
-	- scp
-	- rsync
-	- dd
-	- mkfs
-	- systemctl
-	- crontab
+  - sudo
+  - su
+  - sh -c
+  - bash -c
+  - zsh -c
+  - python -c
+  - python3 -c
+  - rm
+  - mv
+  - chmod
+  - chown
+  - curl
+  - wget
+  - ssh
+  - scp
+  - rsync
+  - dd
+  - mkfs
+  - systemctl
+  - crontab
 command_env_allowlist:
-	- CI
-	- FORCE_COLOR
-	- MYPYPATH
-	- NO_COLOR
-	- PYTEST_ADDOPTS
-	- PYTHONPATH
-	- RUFF_OUTPUT_FORMAT
+  - CI
+  - FORCE_COLOR
+  - MYPYPATH
+  - NO_COLOR
+  - PYTEST_ADDOPTS
+  - PYTHONPATH
+  - RUFF_OUTPUT_FORMAT
 command_working_dirs:
-	- .
+  - .
 write_requires_approval: true
 max_patch_bytes: 32768
 max_patch_hunks: 24

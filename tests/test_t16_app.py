@@ -26,6 +26,8 @@ from linux_agent.audit import (
     EVENT_TOOL_RESULT,
 )
 from linux_agent.app import main
+from linux_agent.config import AgentConfig
+from linux_agent.run_store import save_run_state
 from linux_agent.state import AgentState
 
 
@@ -357,6 +359,95 @@ class TestCLIArguments:
         assert "Affected Files: notes.txt" in out
         assert "Budget Remaining:" in out
         assert "Review Again: --show-pending-run resume-1" in out
+
+    def test_show_pending_run_loads_real_saved_snapshot(self, tmp_path: Path, capsys: Any) -> None:
+        config = AgentConfig(
+            workspace_root=tmp_path,
+            log_dir=tmp_path / "logs",
+            approval_ui_mode="detailed",
+        )
+        saved_state = AgentState(
+            run_id="resume-real-1",
+            user_goal="Create notes.txt",
+            workspace_root=str(tmp_path),
+            messages=[],
+            plan=["Inspect the workspace", "Create notes.txt"],
+            plan_version=2,
+            plan_revision_count=1,
+            plan_steps=[
+                {
+                    "id": "step_1",
+                    "title": "Inspect the workspace",
+                    "status": "completed",
+                    "rationale": None,
+                    "evidence_refs": [1],
+                },
+                {
+                    "id": "step_2",
+                    "title": "Create notes.txt",
+                    "status": "in_progress",
+                    "rationale": "Narrow write requested.",
+                    "evidence_refs": [2],
+                },
+            ],
+            current_step="Create notes.txt",
+            proposed_tool_call={
+                "id": "call_1",
+                "name": "write_file",
+                "args": {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                "risk_level": "high",
+            },
+            observations=[],
+            risk_decision="needs_approval",
+            pending_approval={
+                "id": "approval-real-1",
+                "tool": "write_file",
+                "args": {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                "reason": "Write operations require explicit approval before execution.",
+                "impact_summary": "This request would create workspace file 'notes.txt'.",
+                "diff_preview": "hello",
+                "backup_plan": "Backups will be written before overwrite.",
+                "affected_files": ["notes.txt"],
+                "risk_level": "high",
+                "suggested_verification_command": "uv run pytest",
+                "rollback_command": "--rollback-run resume-real-1",
+            },
+            resume_action=None,
+            pending_verification=None,
+            last_write=None,
+            last_verification=None,
+            last_rollback=None,
+            recovery_state={
+                "issue_type": "search_no_results",
+                "fingerprint": "search:notes",
+                "attempt_count": 1,
+                "last_action": "Try an alternate filename",
+                "can_retry": True,
+            },
+            recovery_attempt_total=1,
+            budget_status={
+                "iteration_count": 1,
+                "command_count": 0,
+                "elapsed_seconds": 8,
+                "warning_triggered": False,
+            },
+            budget_stop_reason=None,
+            iteration_count=1,
+            consecutive_failures=0,
+            final_answer="Approval required before executing tool 'write_file'.",
+        )
+        save_run_state(saved_state, config)
+
+        with patch("linux_agent.app.load_config", return_value=config):
+            code = main(["--show-pending-run", "resume-real-1"])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Approval Review" in out
+        assert "Plan Steps:" in out
+        assert "State Path:" in out
+        assert "Recovery State:" in out
+        assert "Suggested Verification: uv run pytest" in out
 
     def test_verbose_flag_prints_to_stderr(self, tmp_path: Path, capsys: Any) -> None:
         with (

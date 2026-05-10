@@ -258,7 +258,7 @@ def _byte_length(value: object) -> int:
     return len(str(value).encode("utf-8", errors="ignore"))
 
 
-def _preview_text(value: object, *, limit: int = 600) -> str | None:
+def _preview_text(value: object, *, limit: int = 320) -> str | None:
     if value is None:
         return None
     text = value if isinstance(value, str) else str(value)
@@ -267,7 +267,7 @@ def _preview_text(value: object, *, limit: int = 600) -> str | None:
         return None
     preview = "\n".join(line.rstrip() for line in stripped.splitlines()[:12]).strip()
     if len(preview) > limit:
-        return preview[:limit].rstrip() + " ..."
+        return preview[:limit].rstrip() + " …"
     return preview
 
 
