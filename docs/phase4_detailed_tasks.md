@@ -12,7 +12,10 @@
 
 - T18-T35 已完成。
 - T36 已完成。
-- T37-T44 未开始。
+- T37 已完成。
+- T38-T39 未开始。
+- T40 已完成。
+- T41-T44 未开始。
 
 本文默认遵循以下原则：
 
@@ -152,7 +155,7 @@ class BudgetStatus(TypedDict):
 - `run_store.py` 已支持这些字段的持久化与恢复，并对旧快照缺失字段执行保守回填。
 - 已新增 T36 回归测试，覆盖默认值、YAML 覆盖、legacy state 回填和新元数据 round-trip。
 
-### T37 — Planner 计划更新与步骤生命周期
+### T37 — Planner 计划更新与步骤生命周期 已完成
 
 **文件**：`src/linux_agent/graph.py`、`src/linux_agent/state.py`
 
@@ -183,6 +186,13 @@ class BudgetStatus(TypedDict):
 - Agent 可以在命令失败、验证失败、审批拒绝等场景下修订计划，而不是只在 `plan` 尾部堆叠新文本。
 - 计划修订次数受限，超限时行为可预测。
 - verbose 和 audit 中可以看到计划版本变化。
+
+**实现结果（2026-05-10）**：
+
+- Planner prompt 已接入结构化 `plan_steps`、`plan_version`、`plan_revision_count`、预算摘要、最近反思和恢复状态摘要。
+- graph 已在每轮 Planner 后维护结构化步骤生命周期：初始化计划、失败后追加后续步骤、完成后标记 `completed`、失败切换后标记 `blocked`。
+- `plan_update` 审计事件已扩展为包含 `plan_steps`、`plan_version`、`plan_revision_count`、`plan_revision_reason`，CLI verbose 也会显示这些字段。
+- 已新增回归测试覆盖失败后计划修订和计划版本审计落盘。
 
 ### T38 — Reflector 反思评分与结构化决策
 
@@ -249,7 +259,7 @@ class BudgetStatus(TypedDict):
 - 相同错误不会无限重复尝试。
 - 恢复计数和恢复原因会被审计记录。
 
-### T40 — 任务预算执行与硬熔断
+### T40 — 任务预算执行与硬熔断 已完成
 
 **文件**：`src/linux_agent/config.py`、`src/linux_agent/graph.py`、`src/linux_agent/app.py`
 
@@ -282,6 +292,13 @@ class BudgetStatus(TypedDict):
 - Agent 不会在命令数量、运行时长或恢复次数上无限扩张。
 - 不同预算耗尽原因能在 CLI、audit 和最终回答中区分显示。
 - 暂停审批后恢复运行时，预算消耗延续原 run，而不是被重置。
+
+**实现结果（2026-05-10）**：
+
+- `graph.py` 已把 `max_command_count`、`max_runtime_seconds`、`max_plan_revisions`、`max_recovery_attempts_per_issue` 接入实际运行预算。
+- `tool_executor` 会维护 `command_count` 和 `budget_status`；Planner/Reflector 会在预算耗尽时设置 `budget_stop_reason` 并硬停止后续执行。
+- Planner prompt 已显示剩余预算；run_end 审计事件已包含 `budget_status`、`budget_remaining`、`budget_stop_reason`。
+- CLI verbose 已显示预算快照、剩余预算和预算停止原因；新增测试覆盖命令预算熔断、运行时预算熔断和 verbose 渲染。
 
 ### T41 — 审批交互模型与 CLI UI 增强
 

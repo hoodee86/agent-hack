@@ -643,19 +643,39 @@ def _serialize_trace_message(message: BaseMessage) -> dict[str, Any]:
 
 
 def _format_planner_prompt(state: AgentState, config: AgentConfig) -> str:
-    plan_text = (
-        "\n".join(f"  {i + 1}. {step}" for i, step in enumerate(state["plan"]))
-        or "  (not yet planned)"
+    plan_steps = _effective_plan_steps(state)
+    plan_version = _effective_plan_version(state, plan_steps=plan_steps)
+    plan_revision_count = _effective_plan_revision_count(state)
+    recovery_attempt_count = _current_recovery_attempt_count(state)
+    budget_status = _budget_status_snapshot(state)
+    remaining_budget = _budget_remaining(
+        config,
+        budget_status,
+        plan_revision_count=plan_revision_count,
+        recovery_attempt_count=recovery_attempt_count,
     )
     obs_text = _fmt_observations(state["observations"])
     write_text = _format_pending_verification(state)
+    plan_text = _format_structured_plan(plan_steps)
+    last_reflection = _format_last_reflection(state)
+    recovery_text = _format_recovery_state(state)
+    budget_text = _format_budget_for_prompt(
+        config,
+        budget_status,
+        remaining_budget,
+        plan_revision_count=plan_revision_count,
+        recovery_attempt_count=recovery_attempt_count,
+    )
     return (
         f"Goal: {state['user_goal']}\n\n"
         f"Workspace root: {state['workspace_root']}\n\n"
-        f"Current plan:\n{plan_text}\n\n"
+        f"Current plan (version {plan_version}, revisions used {plan_revision_count}/{config.max_plan_revisions}):\n"
+        f"{plan_text}\n\n"
         f"Recent observations:\n{obs_text}\n\n"
+        f"Last reflection:\n{last_reflection}\n\n"
+        f"Recovery state:\n{recovery_text}\n\n"
         f"Write verification status:\n{write_text}\n\n"
-        f"Iterations used: {state['iteration_count']} / {config.max_iterations}\n"
+        f"Remaining budget:\n{budget_text}\n\n"
         f"Consecutive failures: {state['consecutive_failures']} / "
         f"{config.max_consecutive_failures}"
     )
@@ -898,13 +918,443 @@ def _summarize_step(message: AIMessage, tool_call: ToolCall | None) -> str:
     return "Preparing final answer"
 
 
-def _append_plan_step(plan: list[str], step: str) -> list[str]:
-    normalized = step.strip()
-    if not normalized:
-        return plan
-    if plan and plan[-1] == normalized:
-        return plan
-    return [*plan, normalized]
+def _parse_started_at(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _ensure_started_at(state: AgentState) -> str:
+    parsed = _parse_started_at(state.get("started_at"))
+    if parsed is None:
+        return datetime.now(tz=timezone.utc).isoformat()
+    return parsed.isoformat()
+
+
+def _elapsed_seconds(started_at: str | None) -> int:
+    parsed = _parse_started_at(started_at)
+    if parsed is None:
+        return 0
+    return max(0, int((datetime.now(tz=timezone.utc) - parsed).total_seconds()))
+
+
+def _default_plan_steps(plan: list[str], current_step: str | None) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    for index, title in enumerate(plan, start=1):
+        status = "in_progress" if current_step and title == current_step else "pending"
+        steps.append(
+            {
+                "id": f"step_{index}",
+                "title": title,
+                "status": status,
+                "rationale": None,
+                "evidence_refs": [],
+            }
+        )
+    return steps
+
+
+def _effective_plan_steps(state: AgentState) -> list[dict[str, Any]]:
+    raw_steps = state.get("plan_steps")
+    if isinstance(raw_steps, list):
+        normalized_steps: list[dict[str, Any]] = []
+        for index, raw_step in enumerate(raw_steps, start=1):
+            if not isinstance(raw_step, dict):
+                continue
+            title = str(raw_step.get("title", "")).strip()
+            if not title:
+                continue
+            raw_status = str(raw_step.get("status", "pending")).strip()
+            status = (
+                raw_status
+                if raw_status in {"pending", "in_progress", "completed", "blocked", "skipped"}
+                else "pending"
+            )
+            evidence_refs = raw_step.get("evidence_refs")
+            normalized_steps.append(
+                {
+                    "id": str(raw_step.get("id") or f"step_{index}"),
+                    "title": title,
+                    "status": status,
+                    "rationale": cast(str | None, raw_step.get("rationale")),
+                    "evidence_refs": (
+                        [int(value) for value in evidence_refs if isinstance(value, int)]
+                        if isinstance(evidence_refs, list)
+                        else []
+                    ),
+                }
+            )
+        if normalized_steps or not state["plan"]:
+            return normalized_steps
+    return _default_plan_steps(state["plan"], state.get("current_step"))
+
+
+def _effective_plan_version(state: AgentState, *, plan_steps: list[dict[str, Any]] | None = None) -> int:
+    raw_version = state.get("plan_version")
+    if isinstance(raw_version, int) and raw_version >= 0:
+        return raw_version
+    steps = plan_steps if plan_steps is not None else _effective_plan_steps(state)
+    return 1 if steps else 0
+
+
+def _effective_plan_revision_count(state: AgentState) -> int:
+    raw_count = state.get("plan_revision_count")
+    if isinstance(raw_count, int) and raw_count >= 0:
+        return raw_count
+    return 0
+
+
+def _effective_command_count(state: AgentState) -> int:
+    raw_count = state.get("command_count")
+    if isinstance(raw_count, int) and raw_count >= 0:
+        return raw_count
+    return sum(1 for obs in state["observations"] if obs["tool"] == "run_command")
+
+
+def _current_recovery_attempt_count(state: AgentState) -> int:
+    recovery_state = state.get("recovery_state")
+    if not isinstance(recovery_state, dict):
+        return 0
+    raw_attempts = recovery_state.get("attempt_count")
+    if isinstance(raw_attempts, int) and raw_attempts >= 0:
+        return raw_attempts
+    return 0
+
+
+def _budget_status_snapshot(
+    state: AgentState,
+    *,
+    started_at: str | None = None,
+    iteration_count: int | None = None,
+    command_count: int | None = None,
+    warning_triggered: bool | None = None,
+) -> dict[str, Any]:
+    raw_budget = state.get("budget_status")
+    warning_value = False
+    if isinstance(raw_budget, dict):
+        warning_value = bool(raw_budget.get("warning_triggered", False))
+    if warning_triggered is not None:
+        warning_value = warning_triggered
+
+    effective_started_at = started_at if started_at is not None else cast(str | None, state.get("started_at"))
+    return {
+        "iteration_count": (
+            iteration_count if iteration_count is not None else int(state.get("iteration_count", 0))
+        ),
+        "command_count": (
+            command_count if command_count is not None else _effective_command_count(state)
+        ),
+        "elapsed_seconds": _elapsed_seconds(effective_started_at),
+        "warning_triggered": warning_value,
+    }
+
+
+def _budget_remaining(
+    config: AgentConfig,
+    budget_status: dict[str, Any],
+    *,
+    plan_revision_count: int,
+    recovery_attempt_count: int,
+) -> dict[str, Any]:
+    return {
+        "iterations_remaining": max(0, config.max_iterations - int(budget_status["iteration_count"])),
+        "commands_remaining": max(0, config.max_command_count - int(budget_status["command_count"])),
+        "runtime_remaining_seconds": max(0, config.max_runtime_seconds - int(budget_status["elapsed_seconds"])),
+        "plan_revisions_remaining": max(0, config.max_plan_revisions - plan_revision_count),
+        "recovery_attempts_remaining": max(
+            0,
+            config.max_recovery_attempts_per_issue - recovery_attempt_count,
+        ),
+    }
+
+
+def _format_structured_plan(plan_steps: list[dict[str, Any]]) -> str:
+    if not plan_steps:
+        return "  (not yet planned)"
+
+    lines: list[str] = []
+    for index, step in enumerate(plan_steps, start=1):
+        line = f"  {index}. [{step['status']}] {step['title']}"
+        rationale = cast(str | None, step.get("rationale"))
+        if rationale:
+            line += f" — {rationale}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _format_last_reflection(state: AgentState) -> str:
+    reflection = state.get("last_reflection")
+    if not isinstance(reflection, dict):
+        return "None yet."
+    lines = [
+        f"score={reflection.get('score', '(unknown)')}",
+        f"outcome={reflection.get('outcome', '(unknown)')}",
+        f"reason={reflection.get('reason', '(none)')}",
+    ]
+    next_action = reflection.get("recommended_next_action")
+    if next_action:
+        lines.append(f"recommended_next_action={next_action}")
+    return "\n".join(lines)
+
+
+def _format_recovery_state(state: AgentState) -> str:
+    recovery_state = state.get("recovery_state")
+    if not isinstance(recovery_state, dict):
+        return "Not currently recovering from a repeated issue."
+    return "\n".join(
+        [
+            f"issue_type={recovery_state.get('issue_type', '(unknown)')}",
+            f"fingerprint={recovery_state.get('fingerprint', '(unknown)')}",
+            f"attempt_count={recovery_state.get('attempt_count', 0)}",
+            f"last_action={recovery_state.get('last_action', '(none)')}",
+            f"can_retry={bool(recovery_state.get('can_retry', False))}",
+        ]
+    )
+
+
+def _format_budget_for_prompt(
+    config: AgentConfig,
+    budget_status: dict[str, Any],
+    remaining_budget: dict[str, Any],
+    *,
+    plan_revision_count: int,
+    recovery_attempt_count: int,
+) -> str:
+    return "\n".join(
+        [
+            (
+                f"- iterations: {budget_status['iteration_count']} / {config.max_iterations} "
+                f"(remaining {remaining_budget['iterations_remaining']})"
+            ),
+            (
+                f"- commands: {budget_status['command_count']} / {config.max_command_count} "
+                f"(remaining {remaining_budget['commands_remaining']})"
+            ),
+            (
+                f"- runtime: {budget_status['elapsed_seconds']} / {config.max_runtime_seconds}s "
+                f"(remaining {remaining_budget['runtime_remaining_seconds']}s)"
+            ),
+            (
+                f"- plan revisions: {plan_revision_count} / {config.max_plan_revisions} "
+                f"(remaining {remaining_budget['plan_revisions_remaining']})"
+            ),
+            (
+                f"- recovery attempts for current issue: {recovery_attempt_count} / "
+                f"{config.max_recovery_attempts_per_issue} "
+                f"(remaining {remaining_budget['recovery_attempts_remaining']})"
+            ),
+        ]
+    )
+
+
+def _find_plan_step_index(plan_steps: list[dict[str, Any]], title: str | None) -> int | None:
+    if title is None:
+        return None
+    for index, step in enumerate(plan_steps):
+        if step["title"] == title:
+            return index
+    return None
+
+
+def _plan_evidence_refs(state: AgentState) -> list[int]:
+    if not state["observations"]:
+        return []
+    return [len(state["observations"])]
+
+
+def _plan_step_rationale(
+    next_step: str,
+    assistant_content: str,
+    last_obs: Observation | None,
+) -> str | None:
+    first_line = assistant_content.splitlines()[0].strip() if assistant_content.strip() else ""
+    if first_line and first_line != next_step:
+        return first_line[:240]
+    if last_obs is not None and not last_obs["ok"]:
+        return f"Follow-up after {last_obs['tool']} failed."
+    if last_obs is not None and last_obs["tool"] == "run_command":
+        return f"Follow-up after {last_obs['tool']} output."
+    return None
+
+
+def _derive_plan_update(
+    state: AgentState,
+    next_step: str | None,
+    *,
+    assistant_content: str,
+    final_answer: str | None,
+) -> dict[str, Any]:
+    plan_steps = [dict(step) for step in _effective_plan_steps(state)]
+    plan_version = _effective_plan_version(state, plan_steps=plan_steps)
+    plan_revision_count = _effective_plan_revision_count(state)
+    revision_reason: str | None = None
+    last_obs = state["observations"][-1] if state["observations"] else None
+    previous_step = cast(str | None, state.get("current_step"))
+    previous_idx = _find_plan_step_index(plan_steps, previous_step)
+    if previous_idx is None:
+        previous_idx = next(
+            (index for index, step in enumerate(plan_steps) if step["status"] == "in_progress"),
+            None,
+        )
+
+    if previous_idx is not None and (final_answer is not None or next_step != previous_step):
+        previous_status = "completed"
+        if last_obs is not None and not last_obs["ok"]:
+            previous_status = "blocked"
+        plan_steps[previous_idx] = {
+            **plan_steps[previous_idx],
+            "status": previous_status,
+        }
+
+    current_idx: int | None = None
+    if next_step is not None:
+        current_idx = _find_plan_step_index(plan_steps, next_step)
+        if current_idx is None:
+            plan_steps.append(
+                {
+                    "id": f"step_{len(plan_steps) + 1}",
+                    "title": next_step,
+                    "status": "in_progress",
+                    "rationale": _plan_step_rationale(next_step, assistant_content, last_obs),
+                    "evidence_refs": _plan_evidence_refs(state),
+                }
+            )
+            current_idx = len(plan_steps) - 1
+            if len(plan_steps) == 1:
+                plan_version = max(plan_version, 1)
+                revision_reason = "initial_plan_created"
+            else:
+                plan_version = max(plan_version, 1) + 1
+                plan_revision_count += 1
+                revision_reason = (
+                    "appended_step_after_failed_observation"
+                    if last_obs is not None and not last_obs["ok"]
+                    else "appended_step"
+                )
+        else:
+            plan_steps[current_idx] = {
+                **plan_steps[current_idx],
+                "status": "in_progress",
+            }
+
+    if current_idx is not None:
+        for index, step in enumerate(plan_steps):
+            if index == current_idx:
+                continue
+            if step["status"] == "in_progress":
+                fallback_status = "blocked" if last_obs is not None and not last_obs["ok"] else "completed"
+                plan_steps[index] = {**step, "status": fallback_status}
+
+    return {
+        "plan": [str(step["title"]) for step in plan_steps],
+        "current_step": next_step,
+        "plan_steps": plan_steps,
+        "plan_version": plan_version,
+        "plan_revision_count": plan_revision_count,
+        "plan_revision_reason": revision_reason,
+    }
+
+
+def _budget_warning_dimensions(
+    config: AgentConfig,
+    budget_status: dict[str, Any],
+    *,
+    plan_revision_count: int,
+    recovery_attempt_count: int,
+) -> list[str]:
+    dimensions: list[str] = []
+    ratio = config.budget_warning_ratio
+    if config.max_iterations > 0 and budget_status["iteration_count"] / config.max_iterations >= ratio:
+        dimensions.append("max_iterations")
+    if config.max_command_count > 0 and budget_status["command_count"] / config.max_command_count >= ratio:
+        dimensions.append("max_command_count")
+    if config.max_runtime_seconds > 0 and budget_status["elapsed_seconds"] / config.max_runtime_seconds >= ratio:
+        dimensions.append("max_runtime_seconds")
+    if config.max_plan_revisions > 0 and plan_revision_count / config.max_plan_revisions >= ratio:
+        dimensions.append("max_plan_revisions")
+    if (
+        config.max_recovery_attempts_per_issue > 0
+        and recovery_attempt_count / config.max_recovery_attempts_per_issue >= ratio
+    ):
+        dimensions.append("max_recovery_attempts")
+    return dimensions
+
+
+def _build_budget_stop_answer(
+    reason: str,
+    state: AgentState,
+    config: AgentConfig,
+    budget_status: dict[str, Any],
+    *,
+    plan_steps: list[dict[str, Any]] | None = None,
+    current_step: str | None = None,
+    plan_revision_count: int | None = None,
+    recovery_attempt_count: int | None = None,
+) -> str:
+    effective_plan_steps = plan_steps if plan_steps is not None else _effective_plan_steps(state)
+    effective_current_step = current_step if current_step is not None else cast(str | None, state.get("current_step"))
+    effective_plan_revision_count = (
+        plan_revision_count if plan_revision_count is not None else _effective_plan_revision_count(state)
+    )
+    effective_recovery_attempt_count = (
+        recovery_attempt_count
+        if recovery_attempt_count is not None
+        else _current_recovery_attempt_count(state)
+    )
+    completed_steps = [step["title"] for step in effective_plan_steps if step["status"] == "completed"]
+    blocked_steps = [step["title"] for step in effective_plan_steps if step["status"] == "blocked"]
+    reason_line_map = {
+        "max_iterations": (
+            f"Agent stopped: reached the maximum iteration budget "
+            f"({budget_status['iteration_count']} / {config.max_iterations})."
+        ),
+        "max_command_count": (
+            f"Agent stopped: command budget exhausted "
+            f"({budget_status['command_count']} / {config.max_command_count})."
+        ),
+        "max_runtime_seconds": (
+            f"Agent stopped: runtime budget exhausted "
+            f"({budget_status['elapsed_seconds']} / {config.max_runtime_seconds}s)."
+        ),
+        "max_plan_revisions": (
+            f"Agent stopped: plan revision budget exhausted "
+            f"({effective_plan_revision_count} / {config.max_plan_revisions})."
+        ),
+        "max_recovery_attempts": (
+            f"Agent stopped: recovery budget exhausted "
+            f"({effective_recovery_attempt_count} / {config.max_recovery_attempts_per_issue})."
+        ),
+    }
+    lines = [reason_line_map.get(reason, "Agent stopped after exhausting a run budget.")]
+    if completed_steps:
+        lines.append("Completed steps: " + "; ".join(completed_steps[:5]))
+    if effective_current_step is not None:
+        lines.append(f"Current step: {effective_current_step}")
+    if blocked_steps:
+        lines.append("Blocked steps: " + "; ".join(blocked_steps[:5]))
+    lines.extend(
+        [
+            "Budget usage:",
+            f"- iterations: {budget_status['iteration_count']} / {config.max_iterations}",
+            f"- commands: {budget_status['command_count']} / {config.max_command_count}",
+            f"- runtime: {budget_status['elapsed_seconds']} / {config.max_runtime_seconds}s",
+            f"- plan revisions: {effective_plan_revision_count} / {config.max_plan_revisions}",
+            (
+                f"- recovery attempts: {effective_recovery_attempt_count} / "
+                f"{config.max_recovery_attempts_per_issue}"
+            ),
+        ]
+    )
+    if state["observations"]:
+        lines.append("Last observations:")
+        lines.append(_fmt_observations(state["observations"], n=3))
+    return "\n".join(lines)
 
 
 def _is_deepseek_model(model_name: str) -> bool:
@@ -946,6 +1396,58 @@ def _make_planner(
 
     def planner(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
+        started_at = _ensure_started_at(state)
+        plan_steps = _effective_plan_steps(state)
+        plan_version = _effective_plan_version(state, plan_steps=plan_steps)
+        plan_revision_count = _effective_plan_revision_count(state)
+        command_count = _effective_command_count(state)
+        recovery_attempt_count = _current_recovery_attempt_count(state)
+        budget_status = _budget_status_snapshot(
+            state,
+            started_at=started_at,
+            command_count=command_count,
+        )
+
+        if budget_status["elapsed_seconds"] >= config.max_runtime_seconds:
+            final_answer = _build_budget_stop_answer(
+                "max_runtime_seconds",
+                state,
+                config,
+                budget_status,
+                plan_steps=plan_steps,
+                plan_revision_count=plan_revision_count,
+                recovery_attempt_count=recovery_attempt_count,
+            )
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_REFLECTOR_ACTION,
+                {
+                    "reason": "budget_exhausted",
+                    "budget_stop_reason": "max_runtime_seconds",
+                    "budget_status": budget_status,
+                    "budget_remaining": _budget_remaining(
+                        config,
+                        budget_status,
+                        plan_revision_count=plan_revision_count,
+                        recovery_attempt_count=recovery_attempt_count,
+                    ),
+                },
+                event_listener,
+            )
+            return {
+                "started_at": started_at,
+                "plan": [step["title"] for step in plan_steps],
+                "plan_steps": plan_steps,
+                "plan_version": plan_version,
+                "plan_revision_count": plan_revision_count,
+                "command_count": command_count,
+                "budget_status": budget_status,
+                "budget_stop_reason": "max_runtime_seconds",
+                "proposed_tool_call": None,
+                "final_answer": final_answer,
+            }
+
         prompt_message = HumanMessage(content=_format_planner_prompt(state, config))
         history: list[BaseMessage] = state["messages"]
         request_messages = [SystemMessage(content=_SYSTEM_PROMPT), *history, prompt_message]
@@ -963,8 +1465,6 @@ def _make_planner(
             tool_call = _build_tool_call(response, state, config)
 
         assistant_content = _content_to_text(response.content)
-        current_step = _summarize_step(response, tool_call)
-        plan = _append_plan_step(state["plan"], current_step)
 
         final_answer: str | None = None
         if tool_call is None:
@@ -975,16 +1475,106 @@ def _make_planner(
                     "Agent returned neither a tool call nor a final answer."
                 )
 
+        next_step = None if tool_call is None else _summarize_step(response, tool_call)
+        plan_update = _derive_plan_update(
+            state,
+            next_step,
+            assistant_content=assistant_content,
+            final_answer=final_answer,
+        )
+        budget_stop_reason: str | None = None
+        if tool_call is not None and tool_call["name"] == "run_command" and command_count >= config.max_command_count:
+            budget_stop_reason = "max_command_count"
+        elif plan_update["plan_revision_count"] > config.max_plan_revisions:
+            budget_stop_reason = "max_plan_revisions"
+        elif recovery_attempt_count > config.max_recovery_attempts_per_issue:
+            budget_stop_reason = "max_recovery_attempts"
+
+        warning_dimensions = _budget_warning_dimensions(
+            config,
+            budget_status,
+            plan_revision_count=int(plan_update["plan_revision_count"]),
+            recovery_attempt_count=recovery_attempt_count,
+        )
+        if warning_dimensions and not bool(budget_status.get("warning_triggered", False)):
+            budget_status = _budget_status_snapshot(
+                state,
+                started_at=started_at,
+                command_count=command_count,
+                warning_triggered=True,
+            )
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_REFLECTOR_ACTION,
+                {
+                    "reason": "budget_warning",
+                    "dimensions": warning_dimensions,
+                    "budget_status": budget_status,
+                    "budget_remaining": _budget_remaining(
+                        config,
+                        budget_status,
+                        plan_revision_count=int(plan_update["plan_revision_count"]),
+                        recovery_attempt_count=recovery_attempt_count,
+                    ),
+                },
+                event_listener,
+            )
+
+        if budget_stop_reason is not None:
+            final_answer = _build_budget_stop_answer(
+                budget_stop_reason,
+                state,
+                config,
+                budget_status,
+                plan_steps=cast(list[dict[str, Any]], plan_update["plan_steps"]),
+                current_step=cast(str | None, plan_update["current_step"]),
+                plan_revision_count=int(plan_update["plan_revision_count"]),
+                recovery_attempt_count=recovery_attempt_count,
+            )
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_REFLECTOR_ACTION,
+                {
+                    "reason": "budget_exhausted",
+                    "budget_stop_reason": budget_stop_reason,
+                    "attempted_tool": tool_call["name"] if tool_call is not None else None,
+                    "attempted_step": plan_update["current_step"],
+                    "budget_status": budget_status,
+                    "budget_remaining": _budget_remaining(
+                        config,
+                        budget_status,
+                        plan_revision_count=int(plan_update["plan_revision_count"]),
+                        recovery_attempt_count=recovery_attempt_count,
+                    ),
+                },
+                event_listener,
+            )
+
         # ── Audit ────────────────────────────────────────────────────────
         _one_shot_audit(
             run_id,
             config.log_dir,
             EVENT_PLAN_UPDATE,
             {
-                "plan": plan,
-                "current_step": current_step,
+                "plan": plan_update["plan"],
+                "current_step": plan_update["current_step"],
+                "plan_steps": plan_update["plan_steps"],
+                "plan_version": plan_update["plan_version"],
+                "plan_revision_count": plan_update["plan_revision_count"],
+                "plan_revision_reason": plan_update["plan_revision_reason"],
                 "assistant_content": assistant_content or None,
                 "final_answer": final_answer,
+                "budget_status": budget_status,
+                "budget_remaining": _budget_remaining(
+                    config,
+                    budget_status,
+                    plan_revision_count=int(plan_update["plan_revision_count"]),
+                    recovery_attempt_count=recovery_attempt_count,
+                ),
+                "last_reflection": state.get("last_reflection"),
+                "recovery_state": state.get("recovery_state"),
             },
             event_listener,
         )
@@ -999,9 +1589,16 @@ def _make_planner(
 
         return {
             "messages": [prompt_message, response],
-            "plan": plan,
-            "current_step": current_step,
-            "proposed_tool_call": tool_call,
+            "started_at": started_at,
+            "plan": plan_update["plan"],
+            "current_step": plan_update["current_step"],
+            "plan_steps": plan_update["plan_steps"],
+            "plan_version": plan_update["plan_version"],
+            "plan_revision_count": plan_update["plan_revision_count"],
+            "command_count": command_count,
+            "budget_status": budget_status,
+            "budget_stop_reason": budget_stop_reason,
+            "proposed_tool_call": None if budget_stop_reason is not None else tool_call,
             "final_answer": final_answer,
         }
 
@@ -1308,11 +1905,19 @@ def _make_tool_executor(
             ],
             "observations": state["observations"] + [obs],
             "iteration_count": state["iteration_count"] + 1,
+            "command_count": _effective_command_count(state) + (1 if tc["name"] == "run_command" else 0),
             "consecutive_failures": new_failures,
             "risk_decision": None,
             "pending_approval": None,
             "resume_action": None,
             "proposed_tool_call": None,
+            "budget_status": _budget_status_snapshot(
+                state,
+                started_at=cast(str | None, state.get("started_at")),
+                iteration_count=state["iteration_count"] + 1,
+                command_count=_effective_command_count(state) + (1 if tc["name"] == "run_command" else 0),
+            ),
+            "budget_stop_reason": None,
         }
 
         if obs["tool"] in _WRITE_TOOL_NAMES and obs["ok"] and isinstance(result, dict):
@@ -1357,26 +1962,103 @@ def _make_reflector(
     def reflector(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
         last_obs = state["observations"][-1] if state["observations"] else None
+        budget_status = _budget_status_snapshot(state)
+        plan_revision_count = _effective_plan_revision_count(state)
+        recovery_attempt_count = _current_recovery_attempt_count(state)
 
         # Circuit-breaker: total iteration limit
         if state["iteration_count"] >= config.max_iterations:
-            summary = _fmt_observations(state["observations"], n=3)
             _one_shot_audit(
                 run_id,
                 config.log_dir,
                 EVENT_REFLECTOR_ACTION,
                 {
-                    "reason": "max_iterations",
+                    "reason": "budget_exhausted",
+                    "budget_stop_reason": "max_iterations",
                     "iteration_count": state["iteration_count"],
+                    "budget_status": budget_status,
+                    "budget_remaining": _budget_remaining(
+                        config,
+                        budget_status,
+                        plan_revision_count=plan_revision_count,
+                        recovery_attempt_count=recovery_attempt_count,
+                    ),
                 },
                 event_listener,
             )
             return {
-                "final_answer": (
-                    f"Agent stopped: reached the maximum iteration limit "
-                    f"({config.max_iterations}).\n\n"
-                    f"Last observations:\n{summary}"
-                )
+                "budget_status": budget_status,
+                "budget_stop_reason": "max_iterations",
+                "final_answer": _build_budget_stop_answer(
+                    "max_iterations",
+                    state,
+                    config,
+                    budget_status,
+                    plan_revision_count=plan_revision_count,
+                    recovery_attempt_count=recovery_attempt_count,
+                ),
+            }
+
+        if budget_status["elapsed_seconds"] >= config.max_runtime_seconds:
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_REFLECTOR_ACTION,
+                {
+                    "reason": "budget_exhausted",
+                    "budget_stop_reason": "max_runtime_seconds",
+                    "budget_status": budget_status,
+                    "budget_remaining": _budget_remaining(
+                        config,
+                        budget_status,
+                        plan_revision_count=plan_revision_count,
+                        recovery_attempt_count=recovery_attempt_count,
+                    ),
+                },
+                event_listener,
+            )
+            return {
+                "budget_status": budget_status,
+                "budget_stop_reason": "max_runtime_seconds",
+                "final_answer": _build_budget_stop_answer(
+                    "max_runtime_seconds",
+                    state,
+                    config,
+                    budget_status,
+                    plan_revision_count=plan_revision_count,
+                    recovery_attempt_count=recovery_attempt_count,
+                ),
+            }
+
+        if recovery_attempt_count > config.max_recovery_attempts_per_issue:
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_REFLECTOR_ACTION,
+                {
+                    "reason": "budget_exhausted",
+                    "budget_stop_reason": "max_recovery_attempts",
+                    "budget_status": budget_status,
+                    "budget_remaining": _budget_remaining(
+                        config,
+                        budget_status,
+                        plan_revision_count=plan_revision_count,
+                        recovery_attempt_count=recovery_attempt_count,
+                    ),
+                },
+                event_listener,
+            )
+            return {
+                "budget_status": budget_status,
+                "budget_stop_reason": "max_recovery_attempts",
+                "final_answer": _build_budget_stop_answer(
+                    "max_recovery_attempts",
+                    state,
+                    config,
+                    budget_status,
+                    plan_revision_count=plan_revision_count,
+                    recovery_attempt_count=recovery_attempt_count,
+                ),
             }
 
         if last_obs is not None:
@@ -1553,6 +2235,17 @@ def _make_finalizer(
         last_verification = state.get("last_verification")
         last_rollback = state.get("last_rollback")
         pending_verification = state.get("pending_verification")
+        plan_steps = _effective_plan_steps(state)
+        plan_revision_count = _effective_plan_revision_count(state)
+        recovery_attempt_count = _current_recovery_attempt_count(state)
+        budget_status = _budget_status_snapshot(state)
+        budget_remaining = _budget_remaining(
+            config,
+            budget_status,
+            plan_revision_count=plan_revision_count,
+            recovery_attempt_count=recovery_attempt_count,
+        )
+        budget_stop_reason = cast(str | None, state.get("budget_stop_reason"))
         if command_summaries and "Executed commands:" not in final:
             final = f"{final}\n\nExecuted commands:\n" + "\n".join(command_summaries)
         if write_summaries and "Applied file changes:" not in final:
@@ -1597,8 +2290,21 @@ def _make_finalizer(
             if last_rollback.get("error"):
                 rollback_lines.append(f"Error: {last_rollback['error']}")
             final = f"{final}\n\nRollback result:\n" + "\n".join(rollback_lines)
+        if budget_stop_reason is not None and "Budget usage:" not in final:
+            budget_lines = [
+                f"Stop reason: {budget_stop_reason}",
+                f"Iterations: {budget_status['iteration_count']} / {config.max_iterations}",
+                f"Commands: {budget_status['command_count']} / {config.max_command_count}",
+                f"Runtime: {budget_status['elapsed_seconds']} / {config.max_runtime_seconds}s",
+                f"Plan revisions: {plan_revision_count} / {config.max_plan_revisions}",
+            ]
+            if state.get("current_step") is not None:
+                budget_lines.append(f"Current step: {state['current_step']}")
+            final = f"{final}\n\nBudget usage:\n" + "\n".join(budget_lines)
 
-        if state.get("risk_decision") == "needs_approval":
+        if budget_stop_reason is not None:
+            status = "budget_exhausted"
+        elif state.get("risk_decision") == "needs_approval":
             status = "paused_for_approval"
         elif final.startswith("User rejected approval request"):
             status = "approval_rejected"
@@ -1624,10 +2330,16 @@ def _make_finalizer(
                 "final_answer": final,
                 "iteration_count": state["iteration_count"],
                 "observation_count": len(state["observations"]),
-                "command_count": len(command_summaries),
+                "command_count": budget_status["command_count"],
                 "command_summaries": command_summaries,
                 "write_count": len(write_summaries),
                 "write_summaries": write_summaries,
+                "plan_version": _effective_plan_version(state, plan_steps=plan_steps),
+                "plan_revision_count": plan_revision_count,
+                "plan_steps": plan_steps,
+                "budget_status": budget_status,
+                "budget_remaining": budget_remaining,
+                "budget_stop_reason": budget_stop_reason,
                 "verification_status": (
                     None
                     if last_verification is None

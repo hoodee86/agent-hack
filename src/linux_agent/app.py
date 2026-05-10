@@ -391,6 +391,20 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         if data.get("removed_files"):
             _print_field(stream, "Removed Files", data.get("removed_files"), use_color=use_color)
 
+    def _print_budget_fields(data: dict[str, Any]) -> None:
+        if data.get("budget_status") is not None:
+            _print_field(stream, "Budget Status", data.get("budget_status"), use_color=use_color)
+        if data.get("budget_remaining") is not None:
+            _print_field(stream, "Budget Remaining", data.get("budget_remaining"), use_color=use_color)
+        if data.get("budget_stop_reason") is not None:
+            _print_field(
+                stream,
+                "Budget Stop Reason",
+                data.get("budget_stop_reason"),
+                use_color=use_color,
+                inline=True,
+            )
+
     def _print_record(record: AuditEvent, iteration: int | None) -> None:
         data = record["data"]
         event = record["event"]
@@ -411,6 +425,25 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         elif event == EVENT_PLAN_UPDATE:
             _print_field(stream, "Step", data.get("current_step"), use_color=use_color)
             _print_plan(stream, list(data.get("plan", [])), use_color=use_color)
+            if data.get("plan_version") is not None:
+                _print_field(stream, "Plan Version", data.get("plan_version"), use_color=use_color, inline=True)
+            if data.get("plan_revision_count") is not None:
+                _print_field(
+                    stream,
+                    "Plan Revision Count",
+                    data.get("plan_revision_count"),
+                    use_color=use_color,
+                    inline=True,
+                )
+            if data.get("plan_revision_reason") is not None:
+                _print_field(stream, "Plan Revision Reason", data.get("plan_revision_reason"), use_color=use_color)
+            if data.get("plan_steps") is not None:
+                _print_field(stream, "Plan Steps", data.get("plan_steps"), use_color=use_color)
+            _print_budget_fields(data)
+            if data.get("last_reflection") is not None:
+                _print_field(stream, "Last Reflection", data.get("last_reflection"), use_color=use_color)
+            if data.get("recovery_state") is not None:
+                _print_field(stream, "Recovery State", data.get("recovery_state"), use_color=use_color)
             _print_field(stream, "Assistant", data.get("assistant_content"), use_color=use_color)
             if data.get("final_answer") is not None:
                 _print_field(stream, "Final Answer", data.get("final_answer"), use_color=use_color)
@@ -509,12 +542,25 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             _print_field(stream, "Observations", data.get("observation_count"), use_color=use_color, inline=True)
             if data.get("command_count") is not None:
                 _print_field(stream, "Commands", data.get("command_count"), use_color=use_color, inline=True)
+            if data.get("plan_version") is not None:
+                _print_field(stream, "Plan Version", data.get("plan_version"), use_color=use_color, inline=True)
+            if data.get("plan_revision_count") is not None:
+                _print_field(
+                    stream,
+                    "Plan Revision Count",
+                    data.get("plan_revision_count"),
+                    use_color=use_color,
+                    inline=True,
+                )
             if data.get("command_summaries"):
                 _print_field(stream, "Command Summaries", data.get("command_summaries"), use_color=use_color)
             if data.get("write_count") is not None:
                 _print_field(stream, "Writes", data.get("write_count"), use_color=use_color, inline=True)
             if data.get("write_summaries"):
                 _print_field(stream, "Write Summaries", data.get("write_summaries"), use_color=use_color)
+            if data.get("plan_steps") is not None:
+                _print_field(stream, "Plan Steps", data.get("plan_steps"), use_color=use_color)
+            _print_budget_fields(data)
             if data.get("verification_status") is not None:
                 _print_field(stream, "Verification", data.get("verification_status"), use_color=use_color, inline=True)
             if data.get("verification_command") is not None:
