@@ -459,6 +459,8 @@ linux-agent/
 
 验收标准：Agent 可以在用户确认后修改工作区文件，并运行测试验证。
 
+> 阶段 2 / 阶段 3 的详细任务拆解见 `docs/phase2_phase3_detailed_tasks.md`。
+
 ### 阶段 4：增强自主性
 
 - 引入计划更新和反思评分。
