@@ -41,20 +41,14 @@ command_allowlist:
   - uniq
   - echo
   - wc -c
+command_default_risk: low
 command_denylist:
   - sudo
   - su
   - sh -c
   - bash -c
   - zsh -c
-  - python -c
-  - python3 -c
   - rm
-  - mv
-  - chmod
-  - chown
-  - curl
-  - wget
   - ssh
   - scp
   - rsync
@@ -62,6 +56,10 @@ command_denylist:
   - mkfs
   - systemctl
   - crontab
+  - shutdown
+  - reboot
+  - poweroff
+  - halt
 command_env_allowlist:
   - CI
   - FORCE_COLOR

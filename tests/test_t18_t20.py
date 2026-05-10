@@ -55,6 +55,7 @@ class TestT18Config:
         assert "curl -sL" in config.command_allowlist
         assert "wc -c" in config.command_allowlist
         assert "uniq" in config.command_allowlist
+        assert config.command_default_risk == "high"
         assert "sudo" in config.command_denylist
         assert config.command_working_dirs == ["."]
 
@@ -69,6 +70,7 @@ class TestT18Config:
                 max_stderr_bytes: 2048
                 command_allowlist:
                   - pytest
+                                command_default_risk: low
                 command_denylist:
                   - sudo
                 command_working_dirs:
@@ -86,6 +88,7 @@ class TestT18Config:
         assert config.max_output_bytes == 4096
         assert config.max_stderr_bytes == 2048
         assert config.command_allowlist == ["pytest"]
+        assert config.command_default_risk == "low"
         assert config.command_denylist == ["sudo"]
         assert config.command_working_dirs == [".", "tests"]
 
@@ -191,6 +194,11 @@ class TestT19CommandPolicy:
     def test_evaluate_command_call_allows_workspace_root_commands(self, tmp_path: Path) -> None:
         config = make_config(tmp_path)
         assert evaluate_command_call("pwd", config) == "allow"
+
+    def test_evaluate_command_call_denies_unlisted_commands_by_default(self, tmp_path: Path) -> None:
+        config = make_config(tmp_path)
+
+        assert evaluate_command_call("printf hello", config) == "deny"
 
     def test_evaluate_command_call_denies_workspace_escape(self, tmp_path: Path) -> None:
         config = make_config(tmp_path)
@@ -324,6 +332,15 @@ class TestT19CommandPolicy:
             )
             == "allow"
         )
+
+    def test_evaluate_command_call_allows_unlisted_commands_in_relaxed_mode(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_default_risk="low",
+            command_denylist=["sudo", "bash -c"],
+        )
+
+        assert evaluate_command_call("printf hello", config) == "allow"
 
     @pytest.mark.parametrize(
         "command",

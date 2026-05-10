@@ -90,6 +90,10 @@ class AgentConfig(BaseModel):
             "wc -c",
         ]
     )
+    # Fallback risk for commands that do not match any configured prefix.
+    # Keep this strict by default; individual workspaces can opt into a more
+    # permissive mode via config.yaml.
+    command_default_risk: Literal["low", "high"] = "high"
     # Explicitly denied command prefixes or executables
     command_denylist: list[str] = Field(
         default_factory=lambda: [
@@ -217,6 +221,13 @@ class AgentConfig(BaseModel):
             normalized.append(text)
             seen.add(text)
         return normalized
+
+    @field_validator("command_default_risk", mode="before")
+    @classmethod
+    def _normalize_command_default_risk(cls, v: Any) -> str:
+        if v is None:
+            return "high"
+        return str(v).strip().lower()
 
     @model_validator(mode="after")
     def _validate_workspace_exists(self) -> "AgentConfig":

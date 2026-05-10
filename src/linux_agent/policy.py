@@ -815,7 +815,7 @@ def classify_command(
         return "medium"
     if allow_match is not None:
         return "low"
-    return "high"
+    return config.command_default_risk
 
 
 def classify_command_sequence(
