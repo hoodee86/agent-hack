@@ -19,14 +19,15 @@
 - 已实现：`list_dir`、`read_file`、`search_text`、`run_command`、命令审计日志、verbose 命令明细、命令结果驱动的后续诊断。
 - 已完成的阶段 2 验收场景包括：失败测试诊断、类型检查失败总结、命令失败后的文件回读与下一步建议。
 - 当前仍不支持：任意 shell 语法、交互式命令、后台常驻进程、联网下载或安装依赖。
-- `apply_patch` / `write_file` 尚未实现，仍属于阶段 3 的审批写入链路。
+- `apply_patch` / `write_file` 的底层 skill 已实现，但仍未接入 graph 的审批暂停/恢复与写后验证链路。
 
 ### 1.2 当前阶段 3 已落地基础（2026-05-10）
 
 - `AgentState` 已支持 `risk_decision = "needs_approval"` 与 `pending_approval`，可以表达“等待审批”的中间结果。
 - `AgentConfig` 已新增 `write_requires_approval`、`max_patch_bytes`、`max_patch_hunks`、`backup_dir`、`auto_rollback_on_verify_failure`。
 - `policy.py` 已能对 `write_file` / `apply_patch` 给出 `needs_approval` 或 `deny`，并生成结构化审批理由、影响摘要和备份计划。
-- 当前仍未实现：`apply_patch` / `write_file` 的真实执行、审批暂停/恢复、写后验证与回滚。
+- `skills/write.py` 已实现 `apply_patch` 与 `write_file`：前者支持 `Add File` / `Update File` 的 dry-run 校验、备份和原子写入，后者支持 `create_only`、`append`、`overwrite` 三种受限模式。
+- 当前仍未实现：graph 审批暂停/恢复、写后验证、自动回滚，以及把写 skill 暴露给 Planner 的闭环。
 
 ## 2. 范围与非目标
 
@@ -296,13 +297,13 @@ stateDiagram-v2
 }
 ```
 
-安全策略：默认需要审批；支持 `create_only`、`append`、`replace_range`，不建议原型阶段直接提供无限制覆盖。
+安全策略：默认需要审批；当前实现支持 `create_only`、`append`、`overwrite`，其中已有文件修改仍优先推荐走 `apply_patch`，而不是直接覆盖整文件。
 
 #### `apply_patch`
 
 用途：对文本文件应用 diff。
 
-安全策略：比直接覆盖更适合代码修改，因为可审计、可回滚、变更范围清晰。
+安全策略：比直接覆盖更适合代码修改，因为可审计、可回滚、变更范围清晰。当前实现支持仓库内部 `*** Begin Patch` 风格的 `Add File` / `Update File`，并在真正写入前完成 dry-run 匹配校验。
 
 ### 7.2 搜索 Skill
 
