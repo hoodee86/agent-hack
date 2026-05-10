@@ -208,11 +208,29 @@ def _bind_model_tools(llm: BaseChatModel) -> Any:
 
 def _coerce_ai_message(response: Any) -> AIMessage:
     if isinstance(response, AIMessage):
-        return response
+        return _normalize_ai_message(response)
 
     content = getattr(response, "content", response)
     tool_calls = getattr(response, "tool_calls", None) or []
-    return AIMessage(content=content, tool_calls=tool_calls)
+    return _normalize_ai_message(AIMessage(content=content, tool_calls=tool_calls))
+
+
+def _normalize_ai_message(message: AIMessage) -> AIMessage:
+    if len(message.tool_calls) <= 1:
+        return message
+
+    # The graph executes one tool per turn. If the provider emits multiple
+    # tool calls anyway, keep only the first one so the stored assistant
+    # history stays consistent with the single ToolMessage we will append.
+    return cast(
+        AIMessage,
+        message.model_copy(
+            update={
+                "tool_calls": [message.tool_calls[0]],
+                "invalid_tool_calls": [],
+            }
+        ),
+    )
 
 
 def _coerce_tool_args(raw_args: Any) -> dict[str, object]:
@@ -273,6 +291,10 @@ def _append_plan_step(plan: list[str], step: str) -> list[str]:
     return [*plan, normalized]
 
 
+def _is_deepseek_model(model_name: str) -> bool:
+    return model_name.strip().lower().startswith("deepseek")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # T9 – Planner node
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,7 +311,7 @@ def _make_planner(
         prompt_message = HumanMessage(content=_format_planner_prompt(state, config))
         history: list[BaseMessage] = state["messages"]
         raw = llm_with_tools.invoke(
-            [SystemMessage(content=_SYSTEM_PROMPT), prompt_message, *history]
+            [SystemMessage(content=_SYSTEM_PROMPT), *history, prompt_message]
         )
         response = _coerce_ai_message(raw)
         tool_call = _build_tool_call(response, state)
@@ -314,7 +336,7 @@ def _make_planner(
             })
 
         return {
-            "messages": [response],
+            "messages": [prompt_message, response],
             "plan": plan,
             "current_step": current_step,
             "proposed_tool_call": tool_call,
@@ -618,6 +640,11 @@ def build_graph(
             "model": config.llm_model,
             "temperature": config.llm_temperature,
         }
+        if _is_deepseek_model(config.llm_model):
+            # ChatOpenAI does not round-trip DeepSeek reasoning_content across
+            # tool-calling turns, so disable thinking mode when using the
+            # OpenAI-compatible client.
+            llm_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if config.llm_base_url is not None:
             llm_kwargs["base_url"] = config.llm_base_url
         if config.llm_api_key is not None:

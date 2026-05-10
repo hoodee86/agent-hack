@@ -72,6 +72,7 @@ class _StubLLM(BaseChatModel):
     """Minimal stub that cycles through a list of tool-calling turns."""
 
     turns: list[_StubTurn]
+    captures: list[list[BaseMessage]] = []
     _call_count: int = 0
 
     @property
@@ -91,6 +92,7 @@ class _StubLLM(BaseChatModel):
         turns = self.turns
 
         def _invoke(messages: Any, **kw: Any) -> AIMessage:
+            self.captures.append(list(messages))
             idx = min(self._call_count, len(turns) - 1)
             self._call_count += 1  # type: ignore[misc]
             turn = turns[idx]
@@ -105,6 +107,40 @@ class _StubLLM(BaseChatModel):
                         "id": f"call_{idx}",
                         "type": "tool_call",
                     }
+                ],
+            )
+
+        return RunnableLambda(_invoke)
+
+
+class _MultiToolStubLLM(_StubLLM):
+    """Stub that emits multiple tool calls in a single assistant turn."""
+
+    def bind_tools(self, tools: Any, *, tool_choice: Any = None, **kwargs: Any) -> Any:  # type: ignore[override]
+        turns = self.turns
+
+        def _invoke(messages: Any, **kw: Any) -> AIMessage:
+            self.captures.append(list(messages))
+            idx = min(self._call_count, len(turns) - 1)
+            self._call_count += 1  # type: ignore[misc]
+            turn = turns[idx]
+            if turn["tool_name"] is None:
+                return AIMessage(content=turn["content"])
+            return AIMessage(
+                content=turn["content"],
+                tool_calls=[
+                    {
+                        "name": turn["tool_name"],
+                        "args": turn["tool_args"],
+                        "id": f"call_{idx}_0",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "list_dir",
+                        "args": {"path": "."},
+                        "id": f"call_{idx}_1",
+                        "type": "tool_call",
+                    },
                 ],
             )
 
@@ -172,6 +208,54 @@ class TestGraphHappyPath:
         result = app.invoke(_initial_state("Where is main defined?", str(tmp_path)))
         assert result["final_answer"] == "Found def main in src.py"
         assert result["iteration_count"] == 1
+
+    def test_tool_messages_follow_tool_calls_before_next_human_turn(self, tmp_path: Path) -> None:
+        """Planner history must preserve assistant/tool adjacency across turns."""
+        (tmp_path / "src.py").write_text("def main():\n    pass\n")
+        cfg = _make_config(tmp_path)
+        llm = _StubLLM(
+            turns=[
+                _tool_turn(
+                    "search_text",
+                    {"query": "def main"},
+                    content="Searching for def main",
+                ),
+                _final_turn("Found def main in src.py"),
+            ],
+            captures=[],
+        )
+        app = build_graph(cfg, chat_model=llm)
+        result = app.invoke(_initial_state("Where is main defined?", str(tmp_path)))
+
+        assert result["final_answer"] == "Found def main in src.py"
+        assert len(llm.captures) == 2
+        second_turn_roles = [message.type for message in llm.captures[1]]
+        assert second_turn_roles[-3:] == ["ai", "tool", "human"]
+
+    def test_multiple_provider_tool_calls_are_collapsed_to_one_history_entry(self, tmp_path: Path) -> None:
+        """Stored assistant history must not retain extra tool_call ids we never execute."""
+        (tmp_path / "src.py").write_text("def main():\n    pass\n")
+        cfg = _make_config(tmp_path)
+        llm = _MultiToolStubLLM(
+            turns=[
+                _tool_turn(
+                    "search_text",
+                    {"query": "def main"},
+                    content="Searching for def main",
+                ),
+                _final_turn("Found def main in src.py"),
+            ],
+            captures=[],
+        )
+        app = build_graph(cfg, chat_model=llm)
+        result = app.invoke(_initial_state("Where is main defined?", str(tmp_path)))
+
+        assert result["final_answer"] == "Found def main in src.py"
+        assert len(llm.captures) == 2
+        prior_ai = llm.captures[1][-3]
+        assert isinstance(prior_ai, AIMessage)
+        assert len(prior_ai.tool_calls) == 1
+        assert prior_ai.tool_calls[0]["id"] == "call_0_0"
 
 
 class TestGraphSecurityBlocking:

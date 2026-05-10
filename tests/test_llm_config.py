@@ -74,6 +74,7 @@ def test_build_graph_passes_provider_config_to_chatopenai(tmp_path: Path) -> Non
     chat_openai.assert_called_once_with(
         model="deepseek-v4-pro",
         temperature=0.0,
+        extra_body={"thinking": {"type": "disabled"}},
         base_url="https://api.deepseek.com",
         api_key="deepseek-test-key",
     )
