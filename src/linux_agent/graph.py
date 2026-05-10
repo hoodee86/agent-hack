@@ -24,6 +24,7 @@ Graph topology
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Callable
 
@@ -113,6 +114,29 @@ All paths must be relative to the workspace root. Use "." for the root itself.
 - Never set both `tool_name` and `final_answer` at the same time.
 """
 
+# Extra suffix appended to the system prompt in "prompt" mode (no tool_choice support)
+_JSON_SCHEMA_PROMPT = """
+## Output format
+
+You MUST reply with a single JSON object (no prose, no markdown fences) matching:
+
+{
+  "thought": "<your reasoning>",
+  "plan": ["step 1", "step 2", ...],
+  "current_step": "<what you are doing right now>",
+  "tool_name": "list_dir" | "read_file" | "search_text" | null,
+  "tool_args": { ... } | {},
+  "final_answer": "<complete answer>" | null
+}
+
+Rules for tool_args:
+- list_dir:    {"path": "<rel-path>", "recursive": true|false}
+- read_file:   {"path": "<rel-path>", "start_line": <int>, "end_line": <int>}
+- search_text: {"query": "<text>", "path": "<rel-path>", "glob": "**/*"}
+
+Output ONLY the JSON object. No explanation before or after it.
+"""
+
 
 def _fmt_observations(observations: list[Observation], n: int = 5) -> str:
     """Format the last *n* observations for inclusion in the Planner prompt."""
@@ -146,6 +170,33 @@ def _one_shot_audit(
         logger.log(event, data)
 
 
+def _extract_json(text: str) -> dict[str, Any]:
+    """Extract the first JSON object from a model response.
+
+    Handles three common formats:
+    1. ```json\n{...}\n```
+    2. ```\n{...}\n```
+    3. Raw {…} anywhere in the text
+    """
+    # Strip fenced code block
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if fenced:
+        return json.loads(fenced.group(1).strip())  # type: ignore[no-any-return]
+    # Find first { ... } block
+    brace_start = text.find("{")
+    if brace_start != -1:
+        # Walk to find the matching closing brace
+        depth = 0
+        for i, ch in enumerate(text[brace_start:], start=brace_start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(text[brace_start : i + 1])  # type: ignore[no-any-return]
+    raise ValueError(f"No JSON object found in model response:\n{text[:300]}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # T9 – Planner node
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,12 +205,24 @@ def _make_planner(
     config: AgentConfig,
     llm: BaseChatModel,
 ) -> Callable[[AgentState], dict[str, Any]]:
-    """Return a Planner node function closed over *config* and *llm*."""
+    """Return a Planner node function closed over *config* and *llm*.
 
-    structured_llm = llm.with_structured_output(
-        PlannerDecision,
-        method=config.llm_structured_output_method,
-    )
+    Supports three structured-output strategies via config.llm_structured_output_method:
+    - "function_calling" : tool_choice-based (deepseek-chat, GPT models)
+    - "json_schema"      : OpenAI json_schema mode (GPT-4o, o-series)
+    - "prompt"           : pure text + JSON extraction (deepseek-reasoner/R1, any model)
+    """
+    use_prompt_mode = config.llm_structured_output_method == "prompt"
+
+    if use_prompt_mode:
+        structured_llm = None
+        system_prompt = _SYSTEM_PROMPT + _JSON_SCHEMA_PROMPT
+    else:
+        structured_llm = llm.with_structured_output(
+            PlannerDecision,
+            method=config.llm_structured_output_method,
+        )
+        system_prompt = _SYSTEM_PROMPT
 
     def planner(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
@@ -181,11 +244,25 @@ def _make_planner(
         )
 
         lc_messages = [
-            SystemMessage(content=_SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=user_content),
         ]
 
-        decision: PlannerDecision = structured_llm.invoke(lc_messages)  # type: ignore[assignment]
+        if use_prompt_mode:
+            raw = llm.invoke(lc_messages)
+            text = raw.content if hasattr(raw, "content") else str(raw)
+            try:
+                parsed = _extract_json(str(text))
+                decision = PlannerDecision(**parsed)
+            except Exception as exc:
+                decision = PlannerDecision(
+                    thought=f"JSON parse error: {exc}",
+                    plan=state["plan"],
+                    current_step="Parse error",
+                    final_answer=f"Agent encountered a response parse error: {exc}",
+                )
+        else:
+            decision = structured_llm.invoke(lc_messages)  # type: ignore[union-attr,assignment]
 
         # Guard: if neither tool nor answer was provided, force a final answer
         if not decision.tool_name and not decision.final_answer:
