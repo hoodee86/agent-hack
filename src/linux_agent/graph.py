@@ -1,5 +1,5 @@
 """
-LangGraph state machine for the Linux Agent (T9-T14).
+LangGraph state machine for the Linux Agent.
 
 Nodes
 -----
@@ -11,13 +11,20 @@ Nodes
 
 Graph topology
 --------------
-    START → planner ──► policy_guard ──► tool_executor ──► reflector ──┐
-               ↑                                                        │ (loop)
-               └────────────────────────────────────────────────────────┘
+        START → planner ──► policy_guard ──► tool_executor ──► reflector ──┐
+            │          │                          ▲                           │ (loop)
+            │          └──────────────► finalizer │                           │
+            │                                     │                           │
+            └────────► resume_gate ───────────────┘                           │
+                                                                │                                       │
+                                                                └──────────────────────► finalizer      │
+                             └────────────────────────────────────────────────────────┘
 
     planner      → finalizer   when final_answer is set
-    policy_guard → finalizer   when risk_decision is "deny" or "needs_approval"
+        policy_guard → approval_pause when risk_decision is "needs_approval"
+        policy_guard → finalizer   when risk_decision is "deny"
     reflector    → finalizer   when circuit-breaker trips
+        approval_pause → finalizer after persisting the pending approval snapshot
     finalizer    → END
 """
 
@@ -42,6 +49,7 @@ from langgraph.graph import END, START, StateGraph
 
 from linux_agent.audit import (
     AuditEventListener,
+    EVENT_APPROVAL_REQUESTED,
     EVENT_MODEL_INPUT,
     EVENT_PLAN_UPDATE,
     EVENT_POLICY_DECISION,
@@ -49,6 +57,8 @@ from linux_agent.audit import (
     EVENT_RUN_END,
     EVENT_TOOL_PROPOSED,
     EVENT_TOOL_RESULT,
+    EVENT_WRITE_APPLIED,
+    EVENT_WRITE_ROLLBACK,
     AuditLogger,
 )
 from linux_agent.config import AgentConfig
@@ -58,9 +68,11 @@ from linux_agent.policy import (
     classify_command,
     parse_command,
 )
+from linux_agent.run_store import delete_run_state, save_run_state
 from linux_agent.skills.filesystem import list_dir, read_file
 from linux_agent.skills.search import search_text
 from linux_agent.skills.shell import run_command
+from linux_agent.skills.write import apply_patch, write_file
 from linux_agent.state import AgentState, Observation, ToolCall
 
 
@@ -106,7 +118,26 @@ def run_command_tool(
     raise RuntimeError("run_command is executed by linux_agent.graph, not by LangChain.")
 
 
-_MODEL_TOOLS = [list_dir_tool, read_file_tool, search_text_tool, run_command_tool]
+@tool("apply_patch")
+def apply_patch_tool(patch: str) -> str:
+    """Apply a constrained patch payload to workspace text files. This tool always requires explicit approval."""
+    raise RuntimeError("apply_patch is executed by linux_agent.graph, not by LangChain.")
+
+
+@tool("write_file")
+def write_file_tool(path: str, content: str, mode: str = "overwrite") -> str:
+    """Write text content to a workspace file. Modes: overwrite, create_only, append. This tool always requires explicit approval."""
+    raise RuntimeError("write_file is executed by linux_agent.graph, not by LangChain.")
+
+
+_MODEL_TOOLS = [
+    list_dir_tool,
+    read_file_tool,
+    search_text_tool,
+    run_command_tool,
+    apply_patch_tool,
+    write_file_tool,
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,8 +147,8 @@ _MODEL_TOOLS = [list_dir_tool, read_file_tool, search_text_tool, run_command_too
 _SYSTEM_PROMPT = """\
 You are a controlled Linux workspace agent.
 Your task is to answer the user's goal by inspecting the workspace and,
-when useful, running tightly constrained developer commands. You MUST NOT
-write, delete, or modify any files.
+when useful, running tightly constrained developer commands and proposing
+bounded text-only file changes that require explicit approval before execution.
 
 ## Available tools
 
@@ -127,6 +158,8 @@ write, delete, or modify any files.
 | read_file   | path: str (workspace-relative)  | start_line: int (1-based), end_line: int               |
 | search_text | query: str                      | path: str (default "."), glob: str, context_lines: int |
 | run_command | command: str                    | cwd: str (default "."), timeout_seconds: int, env: dict |
+| apply_patch | patch: str                      | none                                                   |
+| write_file  | path: str, content: str         | mode: str (overwrite/create_only/append)               |
 
 All paths and working directories must stay within the workspace root.
 
@@ -135,9 +168,12 @@ All paths and working directories must stay within the workspace root.
 - Use list_dir, read_file, and search_text to inspect files and source code.
 - Use run_command only for safe developer commands such as tests, lint, type checks,
     build diagnostics, or git status/diff.
+- Use apply_patch and write_file only when a file change is necessary to complete the goal.
+- Keep write requests narrow, text-only, and limited to the workspace.
 - Never request shell control syntax such as pipes, redirection, chaining, background
     execution, or shell wrappers.
 - Call at most one tool at a time.
+- If a write tool is required, explain the intended change clearly so the approval summary is useful.
 - After a command fails, inspect the referenced files or error locations before retrying.
 - Answer in plain text when you already have enough information.
 - Do not invent files, directories, file contents, command outputs, or test results.
@@ -301,6 +337,34 @@ def _command_fields_from_result(result: dict[str, Any] | None) -> dict[str, Any]
     return payload
 
 
+def _write_fields_from_result(result: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+
+    payload: dict[str, Any] = {}
+    for key in (
+        "path",
+        "mode",
+        "changed_files",
+        "added_lines",
+        "removed_lines",
+        "backup_paths",
+        "backup_root",
+        "manifest_path",
+        "created",
+        "rolled_back",
+        "restored_files",
+        "removed_files",
+    ):
+        if key in result and result.get(key) is not None:
+            payload[key] = result.get(key)
+
+    diff_preview = _preview_text(result.get("diff"), limit=800)
+    if diff_preview is not None:
+        payload["diff_preview"] = diff_preview
+    return payload
+
+
 def _tool_call_audit_payload(tool_call: ToolCall) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "tool": tool_call["name"],
@@ -310,6 +374,14 @@ def _tool_call_audit_payload(tool_call: ToolCall) -> dict[str, Any]:
     }
     if tool_call["name"] == "run_command":
         payload.update(_command_fields_from_args(tool_call["args"]))
+    if tool_call["name"] == "apply_patch":
+        payload["diff_preview"] = _preview_text(
+            tool_call["args"].get("patch", tool_call["args"].get("diff"))
+        )
+    if tool_call["name"] == "write_file":
+        payload["path"] = tool_call["args"].get("path")
+        payload["mode"] = tool_call["args"].get("mode", "overwrite")
+        payload["diff_preview"] = _preview_text(tool_call["args"].get("content"))
     return payload
 
 
@@ -325,6 +397,8 @@ def _tool_result_audit_payload(tool_call: ToolCall, obs: Observation) -> dict[st
     }
     if obs["tool"] == "run_command":
         payload.update(_command_fields_from_result(obs["result"]))
+    if obs["tool"] in {"apply_patch", "write_file"}:
+        payload.update(_write_fields_from_result(cast(dict[str, Any] | None, obs["result"])))
     return payload
 
 
@@ -577,6 +651,36 @@ def _command_summary_lines(observations: list[Observation]) -> list[str]:
     return lines
 
 
+def _write_summary_lines(observations: list[Observation]) -> list[str]:
+    lines: list[str] = []
+    for obs in observations:
+        result = obs.get("result")
+        if obs["tool"] not in {"apply_patch", "write_file"} or not isinstance(result, dict):
+            continue
+
+        changed_files = result.get("changed_files")
+        if isinstance(changed_files, list) and changed_files:
+            target_summary = ", ".join(str(path) for path in changed_files[:3])
+            if len(changed_files) > 3:
+                target_summary += f" (+{len(changed_files) - 3} more)"
+        else:
+            target_summary = str(result.get("path", "(unknown)"))
+
+        added_lines = int(result.get("added_lines", 0) or 0)
+        removed_lines = int(result.get("removed_lines", 0) or 0)
+        status = "ok" if obs["ok"] else "failed"
+        line = (
+            f"{len(lines) + 1}. {obs['tool']} -> {status} | files: {target_summary} | "
+            f"+{added_lines}/-{removed_lines}"
+        )
+        if result.get("rolled_back"):
+            line += " | rollback applied"
+        elif result.get("backup_paths"):
+            line += " | backup created"
+        lines.append(line)
+    return lines
+
+
 def _summarize_step(message: AIMessage, tool_call: ToolCall | None) -> str:
     content = _content_to_text(message.content)
     if content:
@@ -743,6 +847,88 @@ def _make_policy_guard(
     return policy_guard
 
 
+def _make_approval_pause(
+    config: AgentConfig,
+    event_listener: AuditEventListener | None = None,
+) -> Callable[[AgentState], dict[str, Any]]:
+    def approval_pause(state: AgentState) -> dict[str, Any]:
+        approval_request = state.get("pending_approval")
+        tool_call = state.get("proposed_tool_call")
+        if approval_request is None or tool_call is None:
+            return {}
+
+        snapshot_path = save_run_state(state, config)
+        _one_shot_audit(
+            state["run_id"],
+            config.log_dir,
+            EVENT_APPROVAL_REQUESTED,
+            {
+                **_tool_call_audit_payload(tool_call),
+                "approval_request_id": approval_request["id"],
+                "reason": approval_request["reason"],
+                "impact_summary": approval_request["impact_summary"],
+                "diff_preview": approval_request["diff_preview"],
+                "backup_plan": approval_request["backup_plan"],
+                "state_path": str(snapshot_path),
+                "resume_approve_command": f"--resume-run {state['run_id']} --approve",
+                "resume_reject_command": f"--resume-run {state['run_id']} --reject",
+            },
+            event_listener,
+        )
+
+        message = state.get("final_answer") or (
+            f"Approval required before executing tool '{tool_call['name']}'."
+        )
+        message = (
+            f"{message}\n\n"
+            f"Resume with: --resume-run {state['run_id']} --approve\n"
+            f"Reject with: --resume-run {state['run_id']} --reject"
+        )
+        return {"final_answer": message}
+
+    return approval_pause
+
+
+def _make_resume_gate(config: AgentConfig) -> Callable[[AgentState], dict[str, Any]]:
+    def resume_gate(state: AgentState) -> dict[str, Any]:
+        action = state.get("resume_action")
+        approval_request = state.get("pending_approval")
+        tool_call = state.get("proposed_tool_call")
+
+        if action not in {"approve", "reject"}:
+            return {
+                "final_answer": "Resume requested without a valid approval decision.",
+            }
+
+        if approval_request is None or tool_call is None:
+            delete_run_state(state["run_id"], config)
+            return {
+                "resume_action": None,
+                "final_answer": "No pending approval request was found for this run.",
+            }
+
+        delete_run_state(state["run_id"], config)
+        if action == "approve":
+            return {
+                "resume_action": None,
+                "risk_decision": "allow",
+                "final_answer": None,
+            }
+
+        return {
+            "resume_action": None,
+            "risk_decision": "deny",
+            "pending_approval": None,
+            "proposed_tool_call": None,
+            "final_answer": (
+                f"User rejected approval request '{approval_request['id']}' for tool "
+                f"'{tool_call['name']}'. No changes were applied."
+            ),
+        }
+
+    return resume_gate
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # T11 – ToolExecutor node
 # ─────────────────────────────────────────────────────────────────────────────
@@ -753,6 +939,8 @@ _SKILL_DISPATCH: dict[str, Any] = {
     "read_file": read_file,
     "search_text": search_text,
     "run_command": run_command,
+    "apply_patch": apply_patch,
+    "write_file": write_file,
 }
 
 
@@ -796,14 +984,25 @@ def _make_tool_executor(
                 # primary arg key: "path" for list_dir/read_file,
                 # "query" for search_text, "command" for run_command
                 extra = dict(tc["args"])
+                skill_kwargs: dict[str, Any] = {}
                 if tc["name"] == "search_text":
                     primary = str(extra.pop("query", ""))
+                    result = skill_fn(primary, config, **extra)
                 elif tc["name"] == "run_command":
                     primary = str(extra.pop("command", ""))
+                    result = skill_fn(primary, config, **extra)
+                elif tc["name"] == "apply_patch":
+                    primary = str(extra.pop("patch", extra.pop("diff", "")))
+                    skill_kwargs["run_id"] = state["run_id"]
+                    result = skill_fn(primary, config, **extra, **skill_kwargs)
+                elif tc["name"] == "write_file":
+                    primary = str(extra.pop("path", "."))
+                    content = str(extra.pop("content", ""))
+                    skill_kwargs["run_id"] = state["run_id"]
+                    result = skill_fn(primary, content, config, **extra, **skill_kwargs)
                 else:
                     primary = str(extra.pop("path", "."))
-
-                result: dict[str, Any] = skill_fn(primary, config, **extra)
+                    result = skill_fn(primary, config, **extra)
                 duration_ms = int((time.monotonic() - t0) * 1000)
                 ok = bool(result.get("ok", False))
                 obs = Observation(
@@ -839,6 +1038,32 @@ def _make_tool_executor(
             _tool_result_audit_payload(tc, obs),
             event_listener,
         )
+        result = obs.get("result")
+        if obs["tool"] in {"apply_patch", "write_file"} and isinstance(result, dict):
+            write_payload = {
+                **_tool_result_audit_payload(tc, obs),
+                "approval_request_id": (
+                    state["pending_approval"]["id"]
+                    if state.get("pending_approval") is not None
+                    else None
+                ),
+            }
+            if result.get("rolled_back"):
+                _one_shot_audit(
+                    state["run_id"],
+                    config.log_dir,
+                    EVENT_WRITE_ROLLBACK,
+                    write_payload,
+                    event_listener,
+                )
+            elif obs["ok"]:
+                _one_shot_audit(
+                    state["run_id"],
+                    config.log_dir,
+                    EVENT_WRITE_APPLIED,
+                    write_payload,
+                    event_listener,
+                )
 
         # Reset consecutive_failures on success; increment on failure
         new_failures = 0 if obs["ok"] else state["consecutive_failures"] + 1
@@ -853,6 +1078,9 @@ def _make_tool_executor(
             "observations": state["observations"] + [obs],
             "iteration_count": state["iteration_count"] + 1,
             "consecutive_failures": new_failures,
+            "risk_decision": None,
+            "pending_approval": None,
+            "resume_action": None,
             "proposed_tool_call": None,
         }
 
@@ -952,19 +1180,39 @@ def _make_finalizer(
     def finalizer(state: AgentState) -> dict[str, Any]:
         final = state.get("final_answer") or "(no answer produced)"
         command_summaries = _command_summary_lines(state["observations"])
+        write_summaries = _write_summary_lines(state["observations"])
         if command_summaries and "Executed commands:" not in final:
             final = f"{final}\n\nExecuted commands:\n" + "\n".join(command_summaries)
+        if write_summaries and "Applied file changes:" not in final:
+            final = f"{final}\n\nApplied file changes:\n" + "\n".join(write_summaries)
+
+        if state.get("risk_decision") == "needs_approval":
+            status = "paused_for_approval"
+        elif final.startswith("User rejected approval request"):
+            status = "approval_rejected"
+        elif state.get("risk_decision") == "deny":
+            status = "denied"
+        else:
+            status = "completed"
 
         _one_shot_audit(
             state["run_id"],
             config.log_dir,
             EVENT_RUN_END,
             {
+                "status": status,
                 "final_answer": final,
                 "iteration_count": state["iteration_count"],
                 "observation_count": len(state["observations"]),
                 "command_count": len(command_summaries),
                 "command_summaries": command_summaries,
+                "write_count": len(write_summaries),
+                "write_summaries": write_summaries,
+                "approval_request_id": (
+                    state["pending_approval"]["id"]
+                    if state.get("pending_approval") is not None
+                    else None
+                ),
             },
             event_listener,
         )
@@ -984,8 +1232,22 @@ def _route_planner(state: AgentState) -> str:
     return "policy_guard"
 
 
+def _route_start(state: AgentState) -> str:
+    if state.get("resume_action") in {"approve", "reject"}:
+        return "resume_gate"
+    return "planner"
+
+
+def _route_resume_gate(state: AgentState) -> str:
+    if state.get("final_answer") is not None:
+        return "finalizer"
+    return "tool_executor"
+
+
 def _route_policy_guard(state: AgentState) -> str:
-    if state.get("risk_decision") in {"deny", "needs_approval"}:
+    if state.get("risk_decision") == "needs_approval":
+        return "approval_pause"
+    if state.get("risk_decision") == "deny":
         return "finalizer"
     return "tool_executor"
 
@@ -1044,6 +1306,7 @@ def build_graph(
             "observations": [],
             "risk_decision": None,
             "pending_approval": None,
+            "resume_action": None,
             "iteration_count": 0,
             "consecutive_failures": 0,
             "final_answer": None,
@@ -1073,13 +1336,24 @@ def build_graph(
         "planner",
         _make_planner(config, chat_model, event_listener, prompt_trace_listener),
     )
+    graph.add_node("resume_gate", _make_resume_gate(config))
     graph.add_node("policy_guard", _make_policy_guard(config, event_listener))
+    graph.add_node("approval_pause", _make_approval_pause(config, event_listener))
     graph.add_node("tool_executor", _make_tool_executor(config, event_listener))
     graph.add_node("reflector", _make_reflector(config, event_listener))
     graph.add_node("finalizer", _make_finalizer(config, event_listener))
 
     # ── Entry point ───────────────────────────────────────────────────────
-    graph.add_edge(START, "planner")
+    graph.add_conditional_edges(
+        START,
+        _route_start,
+        {"planner": "planner", "resume_gate": "resume_gate"},
+    )
+    graph.add_conditional_edges(
+        "resume_gate",
+        _route_resume_gate,
+        {"tool_executor": "tool_executor", "finalizer": "finalizer"},
+    )
 
     # ── Conditional edges ─────────────────────────────────────────────────
     graph.add_conditional_edges(
@@ -1090,8 +1364,13 @@ def build_graph(
     graph.add_conditional_edges(
         "policy_guard",
         _route_policy_guard,
-        {"tool_executor": "tool_executor", "finalizer": "finalizer"},
+        {
+            "tool_executor": "tool_executor",
+            "approval_pause": "approval_pause",
+            "finalizer": "finalizer",
+        },
     )
+    graph.add_edge("approval_pause", "finalizer")
     graph.add_edge("tool_executor", "reflector")
     graph.add_conditional_edges(
         "reflector",

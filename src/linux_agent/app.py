@@ -20,6 +20,7 @@ Usage
 Exit codes
 ----------
     0  Agent finished and produced a final answer.
+    2  Agent paused and is waiting for approval before executing a write.
     1  Configuration error or unexpected exception.
 """
 
@@ -38,6 +39,7 @@ from linux_agent.audit import (
     AuditEvent,
     AuditEventListener,
     AuditLogger,
+    EVENT_APPROVAL_REQUESTED,
     EVENT_MODEL_INPUT,
     EVENT_PLAN_UPDATE,
     EVENT_POLICY_DECISION,
@@ -46,9 +48,13 @@ from linux_agent.audit import (
     EVENT_RUN_START,
     EVENT_TOOL_PROPOSED,
     EVENT_TOOL_RESULT,
+    EVENT_WRITE_APPLIED,
+    EVENT_WRITE_ROLLBACK,
 )
 from linux_agent.config import AgentConfig, load_config
 from linux_agent.graph import build_graph
+from linux_agent.run_store import load_run_state
+from linux_agent.skills.write import rollback_run
 from linux_agent.state import AgentState
 
 
@@ -64,7 +70,34 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "goal",
+        nargs="?",
         help="Natural-language goal for the agent (e.g. 'List all Python files').",
+    )
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
+        "--resume-run",
+        metavar="RUN_ID",
+        default=None,
+        help="Resume a paused run and execute or reject its pending approval request.",
+    )
+    action_group.add_argument(
+        "--rollback-run",
+        metavar="RUN_ID",
+        default=None,
+        help="Rollback write changes recorded for a prior run id using its backup manifest.",
+    )
+    decision_group = parser.add_mutually_exclusive_group()
+    decision_group.add_argument(
+        "--approve",
+        action="store_true",
+        default=False,
+        help="Approve the pending write request for --resume-run.",
+    )
+    decision_group.add_argument(
+        "--reject",
+        action="store_true",
+        default=False,
+        help="Reject the pending write request for --resume-run.",
     )
     parser.add_argument(
         "--config",
@@ -208,7 +241,10 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         if counters["iteration"] and event in {
             EVENT_TOOL_PROPOSED,
             EVENT_POLICY_DECISION,
+            EVENT_APPROVAL_REQUESTED,
             EVENT_TOOL_RESULT,
+            EVENT_WRITE_APPLIED,
+            EVENT_WRITE_ROLLBACK,
             EVENT_REFLECTOR_ACTION,
         }:
             return counters["iteration"]
@@ -228,8 +264,26 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             return f"Iteration {iteration} | Tool Proposal"
         if event == EVENT_POLICY_DECISION:
             return f"Iteration {iteration} | Policy Guard"
+        if event == EVENT_APPROVAL_REQUESTED:
+            return (
+                f"Iteration {iteration} | Approval Requested"
+                if iteration is not None
+                else "Approval Requested"
+            )
         if event == EVENT_TOOL_RESULT:
             return f"Iteration {iteration} | Tool Result"
+        if event == EVENT_WRITE_APPLIED:
+            return (
+                f"Iteration {iteration} | Write Applied"
+                if iteration is not None
+                else "Write Applied"
+            )
+        if event == EVENT_WRITE_ROLLBACK:
+            return (
+                f"Iteration {iteration} | Write Rollback"
+                if iteration is not None
+                else "Write Rollback"
+            )
         if event == EVENT_REFLECTOR_ACTION:
             return f"Iteration {iteration} | Reflector"
         return record["event"].replace("_", " ").title()
@@ -251,6 +305,12 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             return _Ansi.RED
         if event == EVENT_TOOL_RESULT:
             return _Ansi.GREEN if record["data"].get("ok") else _Ansi.RED
+        if event == EVENT_APPROVAL_REQUESTED:
+            return _Ansi.YELLOW
+        if event == EVENT_WRITE_APPLIED:
+            return _Ansi.GREEN
+        if event == EVENT_WRITE_ROLLBACK:
+            return _Ansi.YELLOW
         if event == EVENT_REFLECTOR_ACTION:
             return _Ansi.YELLOW
         if event == EVENT_RUN_END:
@@ -308,6 +368,28 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         if data.get("env_keys"):
             _print_field(stream, "Env Keys", data.get("env_keys"), use_color=use_color)
 
+    def _print_write_fields(data: dict[str, Any]) -> None:
+        if data.get("path") is not None:
+            _print_field(stream, "Path", data.get("path"), use_color=use_color, inline=True)
+        if data.get("mode") is not None:
+            _print_field(stream, "Mode", data.get("mode"), use_color=use_color, inline=True)
+        if data.get("changed_files"):
+            _print_field(stream, "Changed Files", data.get("changed_files"), use_color=use_color)
+        if data.get("added_lines") is not None:
+            _print_field(stream, "Added Lines", data.get("added_lines"), use_color=use_color, inline=True)
+        if data.get("removed_lines") is not None:
+            _print_field(stream, "Removed Lines", data.get("removed_lines"), use_color=use_color, inline=True)
+        if data.get("backup_paths"):
+            _print_field(stream, "Backups", data.get("backup_paths"), use_color=use_color)
+        if data.get("manifest_path") is not None:
+            _print_field(stream, "Manifest", data.get("manifest_path"), use_color=use_color)
+        if data.get("diff_preview") is not None:
+            _print_field(stream, "Diff Preview", data.get("diff_preview"), use_color=use_color)
+        if data.get("restored_files"):
+            _print_field(stream, "Restored Files", data.get("restored_files"), use_color=use_color)
+        if data.get("removed_files"):
+            _print_field(stream, "Removed Files", data.get("removed_files"), use_color=use_color)
+
     def _print_record(record: AuditEvent, iteration: int | None) -> None:
         data = record["data"]
         event = record["event"]
@@ -315,6 +397,10 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
 
         if event == EVENT_RUN_START:
             _print_field(stream, "Run ID", record["run_id"], use_color=use_color, inline=True)
+            if data.get("mode") is not None:
+                _print_field(stream, "Mode", data.get("mode"), use_color=use_color, inline=True)
+            if data.get("resume_action") is not None:
+                _print_field(stream, "Resume Action", data.get("resume_action"), use_color=use_color, inline=True)
             _print_field(stream, "Goal", data.get("user_goal"), use_color=use_color)
             _print_field(stream, "Workspace", data.get("workspace_root"), use_color=use_color, inline=True)
             _print_field(stream, "Config", data.get("config"), use_color=use_color)
@@ -352,6 +438,30 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                 _print_field(stream, "Impact Summary", data.get("impact_summary"), use_color=use_color)
             if data.get("backup_plan") is not None:
                 _print_field(stream, "Backup Plan", data.get("backup_plan"), use_color=use_color)
+            if data.get("diff_preview") is not None:
+                _print_field(stream, "Diff Preview", data.get("diff_preview"), use_color=use_color)
+        elif event == EVENT_APPROVAL_REQUESTED:
+            _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
+            _print_field(stream, "Approval ID", data.get("approval_request_id"), use_color=use_color, inline=True)
+            if data.get("risk_level") is not None:
+                _print_field(stream, "Risk Level", data.get("risk_level"), use_color=use_color, inline=True)
+            if data.get("tool") == "run_command":
+                _print_command_fields(data)
+            else:
+                _print_field(stream, "Args", data.get("args"), use_color=use_color)
+                _print_write_fields(data)
+            if data.get("reason") is not None:
+                _print_field(stream, "Reason", data.get("reason"), use_color=use_color)
+            if data.get("impact_summary") is not None:
+                _print_field(stream, "Impact Summary", data.get("impact_summary"), use_color=use_color)
+            if data.get("backup_plan") is not None:
+                _print_field(stream, "Backup Plan", data.get("backup_plan"), use_color=use_color)
+            if data.get("state_path") is not None:
+                _print_field(stream, "State Path", data.get("state_path"), use_color=use_color)
+            if data.get("resume_approve_command") is not None:
+                _print_field(stream, "Approve With", data.get("resume_approve_command"), use_color=use_color)
+            if data.get("resume_reject_command") is not None:
+                _print_field(stream, "Reject With", data.get("resume_reject_command"), use_color=use_color)
         elif event == EVENT_TOOL_RESULT:
             status = "ok" if data.get("ok") else "error"
             _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
@@ -372,19 +482,38 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                     _print_field(stream, "Stderr", data.get("stderr_preview"), use_color=use_color)
                 if data.get("stdout_preview") is not None:
                     _print_field(stream, "Stdout", data.get("stdout_preview"), use_color=use_color)
+            elif data.get("tool") in {"apply_patch", "write_file"}:
+                _print_write_fields(data)
             if data.get("error") is not None:
                 _print_field(stream, "Error", data.get("error"), use_color=use_color)
             _print_field(stream, "Result", data.get("result"), use_color=use_color)
+        elif event == EVENT_WRITE_APPLIED:
+            _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
+            _print_field(stream, "Approval ID", data.get("approval_request_id"), use_color=use_color, inline=True)
+            _print_write_fields(data)
+        elif event == EVENT_WRITE_ROLLBACK:
+            _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
+            if data.get("approval_request_id") is not None:
+                _print_field(stream, "Approval ID", data.get("approval_request_id"), use_color=use_color, inline=True)
+            _print_write_fields(data)
+            if data.get("error") is not None:
+                _print_field(stream, "Error", data.get("error"), use_color=use_color)
         elif event == EVENT_REFLECTOR_ACTION:
             for key, value in data.items():
                 _print_field(stream, key.replace("_", " ").title(), value, use_color=use_color)
         elif event == EVENT_RUN_END:
+            if data.get("status") is not None:
+                _print_field(stream, "Status", data.get("status"), use_color=use_color, inline=True)
             _print_field(stream, "Iterations", data.get("iteration_count"), use_color=use_color, inline=True)
             _print_field(stream, "Observations", data.get("observation_count"), use_color=use_color, inline=True)
             if data.get("command_count") is not None:
                 _print_field(stream, "Commands", data.get("command_count"), use_color=use_color, inline=True)
             if data.get("command_summaries"):
                 _print_field(stream, "Command Summaries", data.get("command_summaries"), use_color=use_color)
+            if data.get("write_count") is not None:
+                _print_field(stream, "Writes", data.get("write_count"), use_color=use_color, inline=True)
+            if data.get("write_summaries"):
+                _print_field(stream, "Write Summaries", data.get("write_summaries"), use_color=use_color)
             _print_field(stream, "Final Answer", data.get("final_answer"), use_color=use_color)
         else:
             _print_field(stream, "Data", data, use_color=use_color)
@@ -406,6 +535,17 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Returns the process exit code."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.resume_run is None and args.rollback_run is None and not args.goal:
+        parser.error("goal is required unless --resume-run or --rollback-run is provided")
+    if args.resume_run is not None and not (args.approve or args.reject):
+        parser.error("--resume-run requires either --approve or --reject")
+    if (args.approve or args.reject) and args.resume_run is None:
+        parser.error("--approve/--reject may only be used with --resume-run")
+    if args.resume_run is not None and args.goal is not None:
+        parser.error("goal is not accepted when using --resume-run")
+    if args.rollback_run is not None and args.goal is not None:
+        parser.error("goal is not accepted when using --rollback-run")
 
     # ── Load config ──────────────────────────────────────────────────────────
     try:
@@ -432,20 +572,133 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
+    def _with_workspace(root: Path) -> AgentConfig:
+        return AgentConfig(
+            **{
+                **config.model_dump(),
+                "workspace_root": root,
+            }
+        )
+
     verbose_enabled = args.verbose or args.show_prompts
     verbose_listener = _make_verbose_event_printer(sys.stderr) if verbose_enabled else None
     prompt_trace_listener = verbose_listener if args.show_prompts else None
 
     # ── Run ──────────────────────────────────────────────────────────────────
-    run_id = str(uuid.uuid4())
+    if args.rollback_run is not None:
+        run_id = args.rollback_run
+        with AuditLogger(run_id, config.log_dir, listener=verbose_listener) as audit:
+            audit.log(
+                EVENT_RUN_START,
+                {
+                    "user_goal": None,
+                    "workspace_root": str(config.workspace_root),
+                    "mode": "rollback",
+                    "config": {
+                        "max_iterations": config.max_iterations,
+                        "max_consecutive_failures": config.max_consecutive_failures,
+                        "llm_model": config.llm_model,
+                    },
+                },
+            )
 
-    # Write run_start audit event
+        result = rollback_run(run_id, config)
+        with AuditLogger(run_id, config.log_dir, listener=verbose_listener) as audit:
+            audit.log(
+                EVENT_WRITE_ROLLBACK,
+                {
+                    "tool": "rollback_run",
+                    **result,
+                },
+            )
+            audit.log(
+                EVENT_RUN_END,
+                {
+                    "status": "rollback_completed" if result.get("ok") else "rollback_failed",
+                    "final_answer": (
+                        f"Rolled back run {run_id}."
+                        if result.get("ok")
+                        else f"Rollback failed for run {run_id}: {result.get('error')}"
+                    ),
+                    "iteration_count": 0,
+                    "observation_count": 0,
+                    "command_count": 0,
+                    "command_summaries": [],
+                    "write_count": 1,
+                    "write_summaries": [],
+                    "approval_request_id": None,
+                },
+            )
+
+        if result.get("ok"):
+            restored = result.get("restored_files") or []
+            removed = result.get("removed_files") or []
+            message = [f"Rolled back run {run_id}."]
+            if restored:
+                message.append(f"Restored: {', '.join(str(path) for path in restored)}")
+            if removed:
+                message.append(f"Removed: {', '.join(str(path) for path in removed)}")
+            print("\n".join(message))
+            return 0
+
+        print(
+            f"[linux-agent] Rollback failed for run {run_id}: {result.get('error')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.resume_run is not None:
+        run_id = args.resume_run
+        try:
+            initial_state = load_run_state(run_id, config)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"[linux-agent] Could not load paused run {run_id}: {exc}", file=sys.stderr)
+            return 1
+
+        resume_workspace = Path(initial_state["workspace_root"]).expanduser().resolve()
+        if args.workspace is not None and resume_workspace != config.workspace_root:
+            print(
+                "[linux-agent] --workspace does not match the paused run's workspace_root.",
+                file=sys.stderr,
+            )
+            return 1
+        if resume_workspace != config.workspace_root:
+            config = _with_workspace(resume_workspace)
+
+        initial_state["resume_action"] = "approve" if args.approve else "reject"
+        user_goal = initial_state["user_goal"]
+        mode = "resume"
+        resume_action = initial_state["resume_action"]
+    else:
+        run_id = str(uuid.uuid4())
+        initial_state = AgentState(
+            run_id=run_id,
+            user_goal=args.goal,
+            workspace_root=str(config.workspace_root),
+            messages=[],
+            plan=[],
+            current_step=None,
+            proposed_tool_call=None,
+            observations=[],
+            risk_decision=None,
+            pending_approval=None,
+            resume_action=None,
+            iteration_count=0,
+            consecutive_failures=0,
+            final_answer=None,
+        )
+        user_goal = args.goal
+        mode = "new"
+        resume_action = None
+
     with AuditLogger(run_id, config.log_dir, listener=verbose_listener) as audit:
         audit.log(
             EVENT_RUN_START,
             {
-                "user_goal": args.goal,
+                "user_goal": user_goal,
                 "workspace_root": str(config.workspace_root),
+                "mode": mode,
+                "resume_action": resume_action,
                 "config": {
                     "max_iterations": config.max_iterations,
                     "max_consecutive_failures": config.max_consecutive_failures,
@@ -453,22 +706,6 @@ def main(argv: list[str] | None = None) -> int:
                 },
             },
         )
-
-    initial_state = AgentState(
-        run_id=run_id,
-        user_goal=args.goal,
-        workspace_root=str(config.workspace_root),
-        messages=[],
-        plan=[],
-        current_step=None,
-        proposed_tool_call=None,
-        observations=[],
-        risk_decision=None,
-        pending_approval=None,
-        iteration_count=0,
-        consecutive_failures=0,
-        final_answer=None,
-    )
 
     try:
         app = build_graph(
@@ -482,6 +719,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(final_state.get("final_answer") or "(no answer produced)")
+    if final_state.get("risk_decision") == "needs_approval":
+        return 2
     return 0
 
 

@@ -1,13 +1,10 @@
-"""Text-writing skills for the Linux Agent (phase 3 foundations).
-
-These skills are not wired into the LangGraph execution path yet; they are
-implemented here so approval and resume flows can invoke them later.
-"""
+"""Text-writing skills for the Linux Agent."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from difflib import unified_diff
+import json
 import os
 from pathlib import Path
 import shutil
@@ -24,6 +21,7 @@ _PATCH_END = "*** End Patch"
 _ADD_FILE_PREFIX = "*** Add File: "
 _UPDATE_FILE_PREFIX = "*** Update File: "
 _DELETE_FILE_PREFIX = "*** Delete File: "
+_MANIFEST_FILENAME = "manifest.json"
 _BINARY_PATH_SUFFIXES: frozenset[str] = frozenset(
     {
         ".7z",
@@ -141,9 +139,72 @@ def _create_backup(source: Path, config: AgentConfig, run_id: str | None) -> Pat
     backup_root = _backup_root(config, run_id)
     relative = source.relative_to(config.workspace_root)
     destination = backup_root / relative
+    if destination.exists():
+        return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     return destination
+
+
+def _manifest_path(config: AgentConfig, run_id: str | None) -> Path:
+    return _backup_root(config, run_id) / _MANIFEST_FILENAME
+
+
+def _load_manifest(config: AgentConfig, run_id: str | None) -> dict[str, Any]:
+    manifest_path = _manifest_path(config, run_id)
+    if not manifest_path.exists():
+        return {
+            "run_id": run_id or manifest_path.parent.name,
+            "entries": [],
+        }
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError(f"write manifest is invalid: {manifest_path}")
+    return payload
+
+
+def _write_manifest(config: AgentConfig, run_id: str | None, manifest: dict[str, Any]) -> Path:
+    manifest_path = _manifest_path(config, run_id)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        template_path=manifest_path if manifest_path.exists() else None,
+    )
+    return manifest_path
+
+
+def _ensure_manifest_entry(
+    config: AgentConfig,
+    run_id: str | None,
+    *,
+    safe_path: Path,
+    display_path: str,
+    action: str,
+    created: bool,
+) -> tuple[dict[str, Any], Path]:
+    manifest = _load_manifest(config, run_id)
+    entries = manifest.setdefault("entries", [])
+    for entry in entries:
+        if entry.get("path") == display_path:
+            manifest_path = _write_manifest(config, run_id, manifest)
+            return entry, manifest_path
+
+    backup_path: str | None = None
+    if not created and safe_path.exists():
+        backup_path = str(_create_backup(safe_path, config, run_id))
+
+    entry = {
+        "path": display_path,
+        "action": action,
+        "created": created,
+        "backup_path": backup_path,
+    }
+    entries.append(entry)
+    manifest_path = _write_manifest(config, run_id, manifest)
+    return entry, manifest_path
 
 
 def _atomic_write_text(path: Path, content: str, *, template_path: Path | None = None) -> None:
@@ -164,6 +225,22 @@ def _atomic_write_text(path: Path, content: str, *, template_path: Path | None =
             mode = stat.S_IMODE(template_path.stat().st_mode)
             os.chmod(temp_path, mode)
 
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_restore_file(path: Path, backup_path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(delete=False, dir=path.parent)
+    temp_path = Path(handle.name)
+    handle.close()
+    try:
+        shutil.copy2(backup_path, temp_path)
         os.replace(temp_path, path)
     except Exception:
         try:
@@ -324,8 +401,83 @@ def _empty_apply_patch_result(error: str) -> dict[str, Any]:
         "removed_lines": 0,
         "diff": "",
         "backup_paths": [],
+        "backup_root": None,
+        "manifest_path": None,
         "file_summaries": [],
+        "rolled_back": False,
+        "restored_files": [],
+        "removed_files": [],
         "error": error,
+    }
+
+
+def _rollback_manifest_entries(
+    entries: list[dict[str, Any]],
+    config: AgentConfig,
+) -> dict[str, Any]:
+    restored_files: list[str] = []
+    removed_files: list[str] = []
+
+    for entry in reversed(entries):
+        display_path = str(entry.get("path", ""))
+        safe_path = resolve_safe_path(
+            config.workspace_root,
+            display_path,
+            config.sensitive_path_parts,
+        )
+        backup_path = entry.get("backup_path")
+        if backup_path:
+            _atomic_restore_file(safe_path, Path(str(backup_path)))
+            restored_files.append(display_path)
+            continue
+        if safe_path.exists():
+            safe_path.unlink()
+            removed_files.append(display_path)
+
+    return {
+        "ok": True,
+        "restored_files": restored_files,
+        "removed_files": removed_files,
+        "error": None,
+    }
+
+
+def rollback_run(run_id: str, config: AgentConfig) -> dict[str, Any]:
+    manifest_path = _manifest_path(config, run_id)
+    if not manifest_path.exists():
+        return {
+            "ok": False,
+            "run_id": run_id,
+            "manifest_path": str(manifest_path),
+            "backup_root": str(_backup_root(config, run_id)),
+            "restored_files": [],
+            "removed_files": [],
+            "error": "write manifest not found",
+        }
+
+    manifest = _load_manifest(config, run_id)
+    entries = [entry for entry in manifest.get("entries", []) if isinstance(entry, dict)]
+    try:
+        rollback_result = _rollback_manifest_entries(entries, config)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "run_id": run_id,
+            "manifest_path": str(manifest_path),
+            "backup_root": str(_backup_root(config, run_id)),
+            "restored_files": [],
+            "removed_files": [],
+            "error": str(exc),
+        }
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "manifest_path": str(manifest_path),
+        "backup_root": str(_backup_root(config, run_id)),
+        "restored_files": rollback_result["restored_files"],
+        "removed_files": rollback_result["removed_files"],
+        "error": None,
     }
 
 
@@ -336,6 +488,7 @@ def apply_patch(
     run_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply a constrained patch using the repository's patch format."""
+    effective_run_id = run_id or f"write-{uuid4().hex[:8]}"
     if not patch_text.strip():
         return _empty_apply_patch_result("patch payload is empty")
     if _contains_nul_bytes(patch_text):
@@ -417,29 +570,57 @@ def apply_patch(
     backup_paths: list[str] = []
     file_summaries: list[dict[str, Any]] = []
     diff_parts: list[str] = []
+    manifest_path: Path | None = None
+    applied_entries: list[dict[str, Any]] = []
 
-    for state in changed_states:
-        original_text = state.original_text
-        current_text = state.current_text or ""
-        if original_text is not None and state.safe_path.exists():
-            backup_paths.append(str(_create_backup(state.safe_path, config, run_id)))
+    try:
+        for state in changed_states:
+            original_text = state.original_text
+            current_text = state.current_text or ""
+            action = "add" if original_text is None else "update"
+            entry, manifest_path = _ensure_manifest_entry(
+                config,
+                effective_run_id,
+                safe_path=state.safe_path,
+                display_path=state.display_path,
+                action=action,
+                created=original_text is None,
+            )
+            applied_entries.append(entry)
+            if entry.get("backup_path"):
+                backup_paths.append(str(entry["backup_path"]))
 
-        _atomic_write_text(
-            state.safe_path,
-            current_text,
-            template_path=state.safe_path if state.safe_path.exists() else None,
-        )
+            _atomic_write_text(
+                state.safe_path,
+                current_text,
+                template_path=state.safe_path if state.safe_path.exists() else None,
+            )
 
-        action = "add" if original_text is None else "update"
-        diff_parts.append(_build_diff(state.display_path, original_text, current_text))
-        file_summaries.append(
-            {
-                "path": state.display_path,
-                "action": action,
-                "added_lines": state.added_lines,
-                "removed_lines": state.removed_lines,
-            }
-        )
+            diff_parts.append(_build_diff(state.display_path, original_text, current_text))
+            file_summaries.append(
+                {
+                    "path": state.display_path,
+                    "action": action,
+                    "added_lines": state.added_lines,
+                    "removed_lines": state.removed_lines,
+                }
+            )
+    except Exception as exc:
+        rollback_result = {
+            "restored_files": [],
+            "removed_files": [],
+        }
+        if applied_entries:
+            rollback_result = _rollback_manifest_entries(applied_entries, config)
+        return {
+            **_empty_apply_patch_result(str(exc)),
+            "backup_paths": backup_paths,
+            "backup_root": str(_backup_root(config, effective_run_id)),
+            "manifest_path": str(manifest_path) if manifest_path is not None else None,
+            "rolled_back": bool(applied_entries),
+            "restored_files": rollback_result["restored_files"],
+            "removed_files": rollback_result["removed_files"],
+        }
 
     return {
         "ok": True,
@@ -448,7 +629,12 @@ def apply_patch(
         "removed_lines": sum(summary["removed_lines"] for summary in file_summaries),
         "diff": "\n\n".join(part for part in diff_parts if part),
         "backup_paths": backup_paths,
+        "backup_root": str(_backup_root(config, effective_run_id)),
+        "manifest_path": str(manifest_path) if manifest_path is not None else None,
         "file_summaries": file_summaries,
+        "rolled_back": False,
+        "restored_files": [],
+        "removed_files": [],
         "error": None,
     }
 
@@ -462,6 +648,7 @@ def write_file(
     run_id: str | None = None,
 ) -> dict[str, Any]:
     """Write bounded text content to a workspace file after approval."""
+    effective_run_id = run_id or f"write-{uuid4().hex[:8]}"
     normalized_mode = mode.strip().lower()
     if normalized_mode not in {"create_only", "append", "overwrite"}:
         return {
@@ -473,8 +660,13 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": f"unsupported write_file mode: {normalized_mode}",
         }
 
@@ -488,8 +680,13 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": "write_file content appears to be binary",
         }
 
@@ -503,8 +700,13 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": "write_file content exceeds max_patch_bytes",
         }
 
@@ -524,8 +726,13 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": "binary files are not supported",
         }
 
@@ -539,8 +746,13 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": "parent directory does not exist",
         }
 
@@ -554,8 +766,13 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": "target path is a directory",
         }
 
@@ -572,8 +789,13 @@ def write_file(
                 "removed_lines": 0,
                 "diff": "",
                 "backup_paths": [],
+                "backup_root": None,
+                "manifest_path": None,
                 "created": False,
                 "bytes_written": 0,
+                "rolled_back": False,
+                "restored_files": [],
+                "removed_files": [],
                 "error": read_error,
             }
 
@@ -587,8 +809,13 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": "file already exists",
         }
 
@@ -602,8 +829,13 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": "file not found",
         }
 
@@ -622,20 +854,54 @@ def write_file(
             "removed_lines": 0,
             "diff": "",
             "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
             "created": False,
             "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
             "error": None,
         }
 
     backup_paths: list[str] = []
-    if old_text is not None and safe_path.exists():
-        backup_paths.append(str(_create_backup(safe_path, config, run_id)))
-
-    _atomic_write_text(
-        safe_path,
-        new_text,
-        template_path=safe_path if safe_path.exists() else None,
+    entry, manifest_path = _ensure_manifest_entry(
+        config,
+        effective_run_id,
+        safe_path=safe_path,
+        display_path=display_path,
+        action=normalized_mode,
+        created=old_text is None,
     )
+    if entry.get("backup_path"):
+        backup_paths.append(str(entry["backup_path"]))
+
+    try:
+        _atomic_write_text(
+            safe_path,
+            new_text,
+            template_path=safe_path if safe_path.exists() else None,
+        )
+    except Exception as exc:
+        rollback_result = _rollback_manifest_entries([entry], config)
+        return {
+            "ok": False,
+            "path": display_path,
+            "mode": normalized_mode,
+            "changed_files": [],
+            "added_lines": 0,
+            "removed_lines": 0,
+            "diff": "",
+            "backup_paths": backup_paths,
+            "backup_root": str(_backup_root(config, effective_run_id)),
+            "manifest_path": str(manifest_path),
+            "created": False,
+            "bytes_written": 0,
+            "rolled_back": True,
+            "restored_files": rollback_result["restored_files"],
+            "removed_files": rollback_result["removed_files"],
+            "error": str(exc),
+        }
 
     diff = _build_diff(display_path, old_text, new_text)
     if normalized_mode == "create_only":
@@ -661,7 +927,12 @@ def write_file(
         "removed_lines": removed_lines,
         "diff": diff,
         "backup_paths": backup_paths,
+        "backup_root": str(_backup_root(config, effective_run_id)),
+        "manifest_path": str(manifest_path),
         "created": old_text is None,
         "bytes_written": _byte_length(content),
+        "rolled_back": False,
+        "restored_files": [],
+        "removed_files": [],
         "error": None,
     }

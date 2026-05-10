@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
+
 from linux_agent.config import AgentConfig
-from linux_agent.skills.write import apply_patch, write_file
+from linux_agent.skills import write as write_skill
+from linux_agent.skills.write import apply_patch, rollback_run, write_file
 
 
 def make_config(tmp_path: Path, **kwargs: object) -> AgentConfig:
@@ -143,6 +147,86 @@ class TestApplyPatch:
         assert result["ok"] is False
         assert result["error"] == "patch payload exceeds max_patch_bytes"
 
+    def test_apply_patch_records_manifest_and_rollback_restores_files(self, tmp_path: Path) -> None:
+        target = tmp_path / "note.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+        (tmp_path / "docs").mkdir()
+        config = make_config(tmp_path)
+
+        result = apply_patch(
+            "\n".join(
+                [
+                    "*** Begin Patch",
+                    "*** Update File: note.txt",
+                    "alpha",
+                    "-beta",
+                    "+gamma",
+                    "*** Add File: docs/new.txt",
+                    "+hello",
+                    "*** End Patch",
+                ]
+            ),
+            config,
+            run_id="run-rollback",
+        )
+
+        assert result["ok"] is True
+        manifest_path = Path(result["manifest_path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert {entry["path"] for entry in manifest["entries"]} == {"note.txt", "docs/new.txt"}
+        assert target.read_text(encoding="utf-8") == "alpha\ngamma\n"
+        assert (tmp_path / "docs" / "new.txt").read_text(encoding="utf-8") == "hello\n"
+
+        rollback = rollback_run("run-rollback", config)
+
+        assert rollback["ok"] is True
+        assert target.read_text(encoding="utf-8") == "alpha\nbeta\n"
+        assert not (tmp_path / "docs" / "new.txt").exists()
+        assert rollback["restored_files"] == ["note.txt"]
+        assert rollback["removed_files"] == ["docs/new.txt"]
+
+    def test_apply_patch_rolls_back_when_second_write_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        first = tmp_path / "first.txt"
+        second = tmp_path / "second.txt"
+        first.write_text("old-first\n", encoding="utf-8")
+        second.write_text("old-second\n", encoding="utf-8")
+        config = make_config(tmp_path)
+
+        original_atomic_write = write_skill._atomic_write_text
+        call_count = {"value": 0}
+
+        def _failing_atomic_write(path: Path, content: str, *, template_path: Path | None = None) -> None:
+            call_count["value"] += 1
+            if call_count["value"] == 2:
+                raise OSError("simulated write failure")
+            original_atomic_write(path, content, template_path=template_path)
+
+        monkeypatch.setattr(write_skill, "_atomic_write_text", _failing_atomic_write)
+
+        result = apply_patch(
+            "\n".join(
+                [
+                    "*** Begin Patch",
+                    "*** Update File: first.txt",
+                    "-old-first",
+                    "+new-first",
+                    "*** Update File: second.txt",
+                    "-old-second",
+                    "+new-second",
+                    "*** End Patch",
+                ]
+            ),
+            config,
+            run_id="run-failure",
+        )
+
+        assert result["ok"] is False
+        assert result["rolled_back"] is True
+        assert first.read_text(encoding="utf-8") == "old-first\n"
+        assert second.read_text(encoding="utf-8") == "old-second\n"
+        assert result["restored_files"] == ["first.txt"]
+        assert result["removed_files"] == []
+
 
 class TestWriteFile:
     def test_create_only_creates_new_file(self, tmp_path: Path) -> None:
@@ -231,3 +315,25 @@ class TestWriteFile:
 
         assert result["ok"] is False
         assert result["error"] == "write_file content exceeds max_patch_bytes"
+
+    def test_write_file_manifest_supports_rollback_of_created_file(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+        config = make_config(tmp_path)
+
+        result = write_file(
+            "docs/output.md",
+            "hello\n",
+            config,
+            mode="create_only",
+            run_id="run-create-rollback",
+        )
+
+        assert result["ok"] is True
+        assert Path(result["manifest_path"]).exists()
+
+        rollback = rollback_run("run-create-rollback", config)
+
+        assert rollback["ok"] is True
+        assert not (tmp_path / "docs" / "output.md").exists()
+        assert rollback["restored_files"] == []
+        assert rollback["removed_files"] == ["docs/output.md"]

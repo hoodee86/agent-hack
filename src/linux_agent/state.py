@@ -95,6 +95,9 @@ class AgentState(TypedDict):
     # Populated when Policy Guard pauses a write operation for approval.
     pending_approval: ApprovalRequest | None
 
+    # Set only when a paused run is resumed from the CLI.
+    resume_action: Literal["approve", "reject"] | None
+
     # Total number of tool executions so far (incremented by Tool Executor)
     iteration_count: int
 

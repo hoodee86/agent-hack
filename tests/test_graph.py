@@ -15,6 +15,7 @@ from langchain_core.runnables import RunnableLambda
 from linux_agent.audit import EVENT_MODEL_INPUT
 from linux_agent.config import AgentConfig
 from linux_agent.graph import build_graph
+from linux_agent.run_store import state_path
 from linux_agent.state import AgentState
 
 
@@ -41,6 +42,7 @@ def _initial_state(
         observations=[],
         risk_decision=None,
         pending_approval=None,
+        resume_action=None,
         iteration_count=0,
         consecutive_failures=0,
         final_answer=None,
@@ -425,7 +427,9 @@ class TestGraphSecurityBlocking:
 
     def test_write_tool_requires_approval(self, tmp_path: Path) -> None:
         """PolicyGuard pauses write tools for approval instead of executing them."""
-        cfg = _make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        cfg = _make_config(tmp_path, log_dir=log_dir)
+        run_id = str(uuid.uuid4())
         llm = _stub_llm(
             _tool_turn(
                 "write_file",
@@ -435,20 +439,89 @@ class TestGraphSecurityBlocking:
         )
         events: list[dict[str, Any]] = []
         app = build_graph(cfg, chat_model=llm, event_listener=events.append)
-        result = app.invoke(_initial_state("Write a file", str(tmp_path)))
+        state = _initial_state("Write a file", str(tmp_path))
+        state["run_id"] = run_id
+        result = app.invoke(state)
 
         assert result["risk_decision"] == "needs_approval"
         assert result["pending_approval"] is not None
         assert result["pending_approval"]["tool"] == "write_file"
         assert "approval required" in (result["final_answer"] or "").lower()
+        assert "--resume-run" in (result["final_answer"] or "")
         assert result["iteration_count"] == 0
         assert result["observations"] == []
+        assert state_path(run_id, cfg).exists()
         assert any(
             event["event"] == "policy_decision"
             and event["data"].get("decision") == "needs_approval"
             and event["data"].get("reason")
             for event in events
         )
+        assert any(event["event"] == "approval_requested" for event in events)
+
+    def test_approved_resume_executes_pending_write_tool(self, tmp_path: Path) -> None:
+        log_dir = tmp_path / "logs"
+        cfg = _make_config(tmp_path, log_dir=log_dir)
+        run_id = str(uuid.uuid4())
+
+        pause_llm = _stub_llm(
+            _tool_turn(
+                "write_file",
+                {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                content="Create notes.txt",
+            )
+        )
+        app = build_graph(cfg, chat_model=pause_llm)
+        paused_state = _initial_state("Create notes.txt", str(tmp_path))
+        paused_state["run_id"] = run_id
+        paused = app.invoke(paused_state)
+
+        resume_llm = _stub_llm(_final_turn("Write completed."))
+        resumed_app = build_graph(cfg, chat_model=resume_llm)
+        resumed_state = AgentState(**{**paused, "resume_action": "approve"})  # type: ignore[misc]
+
+        result = resumed_app.invoke(resumed_state)
+
+        assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "hello\n"
+        assert result["pending_approval"] is None
+        assert result["risk_decision"] is None
+        assert result["iteration_count"] == 1
+        assert "Applied file changes:" in (result["final_answer"] or "")
+        assert not state_path(run_id, cfg).exists()
+
+        import json as _json
+
+        events = [_json.loads(line) for line in (log_dir / f"{run_id}.jsonl").read_text().splitlines() if line]
+        assert any(event["event"] == "approval_requested" for event in events)
+        write_applied = next(event for event in events if event["event"] == "write_applied")
+        assert write_applied["data"]["approval_request_id"] == paused["pending_approval"]["id"]
+        assert write_applied["data"]["changed_files"] == ["notes.txt"]
+
+    def test_rejected_resume_skips_write_execution(self, tmp_path: Path) -> None:
+        cfg = _make_config(tmp_path, log_dir=tmp_path / "logs")
+        run_id = str(uuid.uuid4())
+        pause_llm = _stub_llm(
+            _tool_turn(
+                "write_file",
+                {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                content="Create notes.txt",
+            )
+        )
+        app = build_graph(cfg, chat_model=pause_llm)
+        paused_state = _initial_state("Create notes.txt", str(tmp_path))
+        paused_state["run_id"] = run_id
+        paused = app.invoke(paused_state)
+
+        resumed_app = build_graph(cfg, chat_model=_stub_llm(_final_turn("unused")))
+        resumed_state = AgentState(**{**paused, "resume_action": "reject"})  # type: ignore[misc]
+
+        result = resumed_app.invoke(resumed_state)
+
+        assert not (tmp_path / "notes.txt").exists()
+        assert result["iteration_count"] == 0
+        assert result["observations"] == []
+        assert "rejected approval request" in (result["final_answer"] or "").lower()
+        assert not state_path(run_id, cfg).exists()
 
 
 class TestGraphCircuitBreaker:

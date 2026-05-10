@@ -41,6 +41,7 @@ def _fake_final_state(answer: str, iterations: int = 1) -> AgentState:
         observations=[],
         risk_decision=None,
         pending_approval=None,
+        resume_action=None,
         iteration_count=iterations,
         consecutive_failures=0,
         final_answer=answer,
@@ -123,6 +124,34 @@ def _mock_graph_with_events(answer: str = "OK") -> MagicMock:
         return app
 
     return MagicMock(side_effect=_factory)
+
+
+def _mock_config(tmp_path: Path) -> MagicMock:
+    return MagicMock(
+        workspace_root=tmp_path,
+        log_dir=tmp_path / "logs",
+        max_iterations=12,
+        max_consecutive_failures=3,
+        llm_model="deepseek-v4-pro",
+        model_dump=MagicMock(
+            return_value={
+                "workspace_root": tmp_path,
+                "log_dir": tmp_path / "logs",
+                "max_iterations": 12,
+                "max_consecutive_failures": 3,
+                "llm_model": "deepseek-v4-pro",
+                "llm_temperature": 0.0,
+                "max_read_bytes": 65536,
+                "max_search_results": 100,
+                "max_list_entries": 200,
+                "sensitive_path_parts": [],
+                "backup_dir": tmp_path / ".linux-agent" / "backups",
+                "max_patch_bytes": 65536,
+                "max_patch_hunks": 16,
+                "auto_rollback_on_verify_failure": False,
+            }
+        ),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +256,11 @@ class TestCLIArguments:
         ):
             code = main(["goal"])
         assert code == 1
+
+    def test_resume_run_requires_decision(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["--resume-run", "run-1"])
+        assert exc_info.value.code != 0
 
     def test_verbose_flag_prints_to_stderr(self, tmp_path: Path, capsys: Any) -> None:
         with (
@@ -506,6 +540,114 @@ class TestCLIArguments:
             code = main(["What is 6*7?"])
         assert code == 0
         assert "The answer is 42" in capsys.readouterr().out
+
+    def test_approval_pause_returns_exit_code_2(self, tmp_path: Path, capsys: Any) -> None:
+        paused_state = AgentState(
+            **{
+                **_fake_final_state("Approval required before executing tool 'write_file'."),
+                "run_id": "paused-run",
+                "risk_decision": "needs_approval",
+                "pending_approval": {
+                    "id": "approval-1",
+                    "tool": "write_file",
+                    "args": {"path": "notes.txt", "content": "hello"},
+                    "reason": "Write operations require explicit approval before execution.",
+                    "impact_summary": "This request would create workspace file 'notes.txt'.",
+                    "diff_preview": "hello",
+                    "backup_plan": "Backups will be written before overwrite.",
+                },
+            }
+        )
+        app = MagicMock()
+        app.invoke.return_value = paused_state
+
+        with (
+            patch("linux_agent.app.build_graph", MagicMock(return_value=app)),
+            patch("linux_agent.app.load_config", return_value=_mock_config(tmp_path)),
+        ):
+            code = main(["goal"])
+
+        assert code == 2
+        assert "Approval required" in capsys.readouterr().out
+
+    def test_resume_run_approve_loads_saved_state(self, tmp_path: Path, capsys: Any) -> None:
+        saved_state = AgentState(
+            run_id="resume-1",
+            user_goal="Create notes.txt",
+            workspace_root=str(tmp_path),
+            messages=[],
+            plan=["Create notes.txt"],
+            current_step="Create notes.txt",
+            proposed_tool_call={
+                "id": "call_1",
+                "name": "write_file",
+                "args": {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                "risk_level": "high",
+            },
+            observations=[],
+            risk_decision="needs_approval",
+            pending_approval={
+                "id": "approval-1",
+                "tool": "write_file",
+                "args": {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                "reason": "Write operations require explicit approval before execution.",
+                "impact_summary": "This request would create workspace file 'notes.txt'.",
+                "diff_preview": "hello",
+                "backup_plan": "Backups will be written before overwrite.",
+            },
+            resume_action=None,
+            iteration_count=0,
+            consecutive_failures=0,
+            final_answer="Approval required before executing tool 'write_file'.",
+        )
+
+        captured_state: dict[str, Any] = {}
+
+        def _build_graph(*args: Any, **kwargs: Any) -> MagicMock:
+            app = MagicMock()
+
+            def _invoke(state: AgentState) -> AgentState:
+                captured_state.update(state)
+                return _fake_final_state("Write completed.")
+
+            app.invoke.side_effect = _invoke
+            return app
+
+        with (
+            patch("linux_agent.app.build_graph", MagicMock(side_effect=_build_graph)),
+            patch("linux_agent.app.load_config", return_value=_mock_config(tmp_path)),
+            patch("linux_agent.app.load_run_state", return_value=saved_state),
+        ):
+            code = main(["--resume-run", "resume-1", "--approve"])
+
+        assert code == 0
+        assert captured_state["resume_action"] == "approve"
+        assert captured_state["user_goal"] == "Create notes.txt"
+        assert "Write completed." in capsys.readouterr().out
+
+    def test_rollback_run_calls_helper(self, tmp_path: Path, capsys: Any) -> None:
+        with (
+            patch("linux_agent.app.load_config", return_value=_mock_config(tmp_path)),
+            patch(
+                "linux_agent.app.rollback_run",
+                return_value={
+                    "ok": True,
+                    "run_id": "run-1",
+                    "manifest_path": str(tmp_path / "logs" / "manifest.json"),
+                    "backup_root": str(tmp_path / ".linux-agent" / "backups" / "run-1"),
+                    "restored_files": ["notes.txt"],
+                    "removed_files": ["docs/new.txt"],
+                    "error": None,
+                },
+            ),
+        ):
+            code = main(["--rollback-run", "run-1"])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Rolled back run run-1." in out
+        assert "Restored: notes.txt" in out
+        assert "Removed: docs/new.txt" in out
 
     def test_audit_run_start_log_written(self, tmp_path: Path) -> None:
         """main() must write a run_start event to the JSONL audit log."""

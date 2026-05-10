@@ -12,22 +12,27 @@
 - 对高风险操作触发人工确认或策略拒绝。
 - 记录完整行动轨迹，便于调试、复盘和安全审计。
 
-> 当前仓库已完整覆盖第一阶段只读能力，并已落地第二阶段的核心执行链路：命令执行配置、命令策略解析、`run_command` skill、graph 集成、命令审计与 verbose 输出、以及命令结果驱动的 Reflector / Finalizer 总结。默认仍使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`。第三阶段中，审批模型相关基础（`needs_approval`、`pending_approval`、写操作配置、写策略决策）已经落地，但真正的写 skill、审批暂停/恢复、备份回滚仍属于后续工作。
+> 当前仓库已完整覆盖第一阶段只读能力，并已落地第二阶段的核心执行链路：命令执行配置、命令策略解析、`run_command` skill、graph 集成、命令审计与 verbose 输出、以及命令结果驱动的 Reflector / Finalizer 总结。默认仍使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`。第三阶段中，写 skill、审批暂停/恢复、写操作审计、备份 manifest 与 CLI 级回滚已落地；当前剩余工作主要集中在写后验证闭环和更强的 Planner / Reflector 策略。
 
 ### 1.1 当前阶段 2 实现边界（2026-05-10）
 
 - 已实现：`list_dir`、`read_file`、`search_text`、`run_command`、命令审计日志、verbose 命令明细、命令结果驱动的后续诊断。
 - 已完成的阶段 2 验收场景包括：失败测试诊断、类型检查失败总结、命令失败后的文件回读与下一步建议。
 - 当前仍不支持：任意 shell 语法、交互式命令、后台常驻进程、联网下载或安装依赖。
-- `apply_patch` / `write_file` 的底层 skill 已实现，但仍未接入 graph 的审批暂停/恢复与写后验证链路。
+- `apply_patch` / `write_file` 已接入 graph，并通过审批暂停 / 恢复链路受控执行。
+- CLI 已支持 `--resume-run <run_id> --approve|--reject` 和 `--rollback-run <run_id>`。
+- 审计日志已补充 `approval_requested`、`write_applied`、`write_rollback`。
 
-### 1.2 当前阶段 3 已落地基础（2026-05-10）
+### 1.2 当前阶段 3 已落地能力（2026-05-10）
 
 - `AgentState` 已支持 `risk_decision = "needs_approval"` 与 `pending_approval`，可以表达“等待审批”的中间结果。
+- `AgentState` 已支持 `resume_action`，可从持久化审批状态恢复执行。
 - `AgentConfig` 已新增 `write_requires_approval`、`max_patch_bytes`、`max_patch_hunks`、`backup_dir`、`auto_rollback_on_verify_failure`。
 - `policy.py` 已能对 `write_file` / `apply_patch` 给出 `needs_approval` 或 `deny`，并生成结构化审批理由、影响摘要和备份计划。
-- `skills/write.py` 已实现 `apply_patch` 与 `write_file`：前者支持 `Add File` / `Update File` 的 dry-run 校验、备份和原子写入，后者支持 `create_only`、`append`、`overwrite` 三种受限模式。
-- 当前仍未实现：graph 审批暂停/恢复、写后验证、自动回滚，以及把写 skill 暴露给 Planner 的闭环。
+- `skills/write.py` 已实现 `apply_patch` 与 `write_file`：前者支持 `Add File` / `Update File` 的 dry-run 校验、备份、manifest 与原子写入，后者支持 `create_only`、`append`、`overwrite` 三种受限模式，并共享回滚记录。
+- `graph.py` 已支持审批暂停、批准恢复到 `tool_executor`、拒绝终止，以及写操作专用审计事件。
+- `app.py` 已支持退出码 `2` 的审批暂停提示、`--resume-run <run_id> --approve|--reject`、以及 `--rollback-run <run_id>`。
+- 当前仍未实现：写后自动验证闭环、验证失败后的策略化自动回滚，以及 Planner / Reflector 对写操作的更强约束。
 
 ## 2. 范围与非目标
 

@@ -81,6 +81,7 @@ class TestT26ConfigAndState:
             observations=[],
             risk_decision="needs_approval",
             pending_approval=approval,
+            resume_action=None,
             iteration_count=0,
             consecutive_failures=0,
             final_answer="Approval required before executing tool 'write_file'.",

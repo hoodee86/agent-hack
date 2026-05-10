@@ -12,7 +12,8 @@
 
 - T18-T25 已完成。
 - T26-T29 已完成。
-- T30-T35 未开始。
+- T30-T32 已完成。
+- T33-T35 未开始。
 
 本文默认遵循以下原则：
 
@@ -432,7 +433,7 @@ class ApprovalRequest(TypedDict):
 - 不能覆盖 workspace 外或敏感文件。
 - 与 `apply_patch` 相比，`write_file` 的适用边界在文档中清晰可见。
 
-### T30 — 审批暂停 / 恢复链路（graph.py / app.py）
+### T30 — 审批暂停 / 恢复链路（graph.py / app.py） 已完成
 
 **文件**：`src/linux_agent/graph.py`、`src/linux_agent/app.py`，必要时新增持久化辅助模块
 
@@ -453,7 +454,13 @@ class ApprovalRequest(TypedDict):
 - 用户批准后，Agent 可以继续执行同一 run。
 - 用户拒绝后，不会对文件系统产生任何修改。
 
-### T31 — diff、变更摘要与审计落盘
+**当前实现补充**：
+
+- 已新增持久化 run state，默认落在 `log_dir/state/<run_id>.json`。
+- CLI 已支持 `--resume-run <run_id> --approve` 与 `--resume-run <run_id> --reject`。
+- 遇到审批请求时，CLI 以退出码 `2` 结束当前进程，并输出恢复指令。
+
+### T31 — diff、变更摘要与审计落盘 已完成
 
 **文件**：`src/linux_agent/audit.py`、`src/linux_agent/app.py`、写操作 skill
 
@@ -481,7 +488,13 @@ class ApprovalRequest(TypedDict):
 - 大 diff 在控制台中只显示预览，在日志中保留完整或更大额度的记录。
 - 审批请求与实际写入事件能通过 request id 关联。
 
-### T32 — 备份、原子写入与回滚
+**当前实现补充**：
+
+- 已补充 `approval_requested`、`write_applied`、`write_rollback` 三类审计事件。
+- `app.py --verbose` 已能打印目标文件、diff 预览、backup/manifest、rollback 明细。
+- `run_end` 已追加 write summaries，便于 CLI 和日志汇总写入结果。
+
+### T32 — 备份、原子写入与回滚 已完成
 
 **文件**：`src/linux_agent/skills/write.py`、`src/linux_agent/config.py`
 
@@ -502,6 +515,12 @@ class ApprovalRequest(TypedDict):
 - 任意失败场景下都能定位备份并恢复原始内容。
 - 原子写入不会留下半写入文件。
 - 回滚事件能被日志和最终回答引用。
+
+**当前实现补充**：
+
+- `apply_patch` / `write_file` 已维护每个 run 的 manifest，记录原路径与备份路径映射。
+- 多文件 patch 在中途写失败时会回滚已写入文件，避免半写状态。
+- CLI 已支持 `--rollback-run <run_id>` 基于 manifest 恢复变更。
 
 ### T33 — Planner / Reflector 写操作闭环
 
@@ -607,14 +626,14 @@ class ApprovalRequest(TypedDict):
 
 ### M3.1 — 审批写入 MVP
 
-- 完成 T26-T31
-- 只支持 `apply_patch`
-- 支持暂停审批、批准恢复、diff 落盘
+- 完成 T26-T32
+- 支持 `apply_patch` 与受限 `write_file`
+- 支持暂停审批、批准恢复、diff/manifest 落盘与回滚
 
 ### M3.2 — 回滚与验证闭环
 
-- 完成 T32-T35
-- 支持备份、回滚、写后验证、文档收口
+- 完成 T33-T35
+- 支持写后验证、回滚策略联动、文档收口
 
 ## 非目标与边界
 
