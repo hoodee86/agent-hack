@@ -14,7 +14,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from linux_agent.config import AgentConfig
-from linux_agent.policy import resolve_safe_path
+from linux_agent.policy import PolicyViolation, resolve_safe_path
 
 _PATCH_BEGIN = "*** Begin Patch"
 _PATCH_END = "*** End Patch"
@@ -508,11 +508,14 @@ def apply_patch(
         if section.action == "delete":
             return _empty_apply_patch_result("Delete File sections are not supported yet")
 
-        safe_path = resolve_safe_path(
-            config.workspace_root,
-            section.path,
-            config.sensitive_path_parts,
-        )
+        try:
+            safe_path = resolve_safe_path(
+                config.workspace_root,
+                section.path,
+                config.sensitive_path_parts,
+            )
+        except PolicyViolation as exc:
+            return _empty_apply_patch_result(str(exc))
         display_path = _display_path(config, safe_path)
 
         if _is_probably_binary_path(display_path):
@@ -710,11 +713,31 @@ def write_file(
             "error": "write_file content exceeds max_patch_bytes",
         }
 
-    safe_path = resolve_safe_path(
-        config.workspace_root,
-        path,
-        config.sensitive_path_parts,
-    )
+    try:
+        safe_path = resolve_safe_path(
+            config.workspace_root,
+            path,
+            config.sensitive_path_parts,
+        )
+    except PolicyViolation as exc:
+        return {
+            "ok": False,
+            "path": path,
+            "mode": normalized_mode,
+            "changed_files": [],
+            "added_lines": 0,
+            "removed_lines": 0,
+            "diff": "",
+            "backup_paths": [],
+            "backup_root": None,
+            "manifest_path": None,
+            "created": False,
+            "bytes_written": 0,
+            "rolled_back": False,
+            "restored_files": [],
+            "removed_files": [],
+            "error": str(exc),
+        }
     display_path = _display_path(config, safe_path)
     if _is_probably_binary_path(display_path):
         return {

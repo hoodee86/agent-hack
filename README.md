@@ -12,6 +12,7 @@
 - 命令执行审计、verbose 控制台明细、以及命令结果摘要
 - 命令失败后的继续诊断：可先跑 `pytest` / `mypy`，再读取相关文件继续总结
 - 审批暂停 / 恢复、写操作审计、备份 manifest 与按 run id 回滚
+- 写后强制验证，以及验证失败时的自动回滚摘要
 
 ## 快速开始
 
@@ -93,8 +94,12 @@ Command Summaries:
 
 - 写操作不会直接执行；当模型提出 `apply_patch` / `write_file` 时，当前进程会输出审批摘要并以退出码 `2` 结束。
 - 审批状态会持久化到 `log_dir/state/<run_id>.json`，可通过 `--resume-run <run_id> --approve|--reject` 恢复或拒绝。
-- 每次写入都会记录 backup manifest 和审计事件；如需恢复，可执行 `--rollback-run <run_id>`。
-- `--verbose` 下会额外看到 `approval_requested`、`write_applied`、`write_rollback` 的详细输出，包括目标文件、diff 预览、备份和回滚信息。
+- 审批通过后的写入不会直接宣告成功；agent 必须先运行一次验证命令，如测试、lint 或类型检查。
+- 若模型在写后直接尝试结束，graph 会阻断这次完成并返回“仍需验证”的结果。
+- `auto_rollback_on_verify_failure=true` 时，验证失败会自动基于 manifest 回滚最近一次写入；如需手工恢复，也可执行 `--rollback-run <run_id>`。
+- `--verbose` 下会额外看到 `approval_requested`、`write_applied`、`write_rollback`、验证状态、验证命令和 rollback 结果。
+
+一次完整的阶段 3 流程通常是：读取上下文 -> 提出 `apply_patch` / `write_file` -> CLI 暂停等待审批 -> `--resume-run <run_id> --approve` -> 自动执行写入 -> 自动要求验证命令 -> 根据验证结果总结完成或回滚。
 
 ## 开发
 

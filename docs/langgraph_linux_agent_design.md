@@ -12,7 +12,7 @@
 - 对高风险操作触发人工确认或策略拒绝。
 - 记录完整行动轨迹，便于调试、复盘和安全审计。
 
-> 当前仓库已完整覆盖第一阶段只读能力，并已落地第二阶段的核心执行链路：命令执行配置、命令策略解析、`run_command` skill、graph 集成、命令审计与 verbose 输出、以及命令结果驱动的 Reflector / Finalizer 总结。默认仍使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`。第三阶段中，写 skill、审批暂停/恢复、写操作审计、备份 manifest 与 CLI 级回滚已落地；当前剩余工作主要集中在写后验证闭环和更强的 Planner / Reflector 策略。
+> 当前仓库已完整覆盖第一阶段只读能力，并已落地第二阶段的核心执行链路：命令执行配置、命令策略解析、`run_command` skill、graph 集成、命令审计与 verbose 输出、以及命令结果驱动的 Reflector / Finalizer 总结。默认仍使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`。第三阶段中，写 skill、审批暂停/恢复、写操作审计、备份 manifest、写后验证、验证失败自动回滚与 CLI 级恢复/回滚链路均已落地。
 
 ### 1.1 当前阶段 2 实现边界（2026-05-10）
 
@@ -22,6 +22,8 @@
 - `apply_patch` / `write_file` 已接入 graph，并通过审批暂停 / 恢复链路受控执行。
 - CLI 已支持 `--resume-run <run_id> --approve|--reject` 和 `--rollback-run <run_id>`。
 - 审计日志已补充 `approval_requested`、`write_applied`、`write_rollback`。
+- 成功写入后，Planner / Reflector 会强制要求一次验证命令；未验证写入不会被当作成功完成。
+- 当验证命令失败且 `auto_rollback_on_verify_failure=true` 时，graph 会自动基于 manifest 执行回滚，并把结果写入最终回答与审计日志。
 
 ### 1.2 当前阶段 3 已落地能力（2026-05-10）
 
@@ -32,7 +34,8 @@
 - `skills/write.py` 已实现 `apply_patch` 与 `write_file`：前者支持 `Add File` / `Update File` 的 dry-run 校验、备份、manifest 与原子写入，后者支持 `create_only`、`append`、`overwrite` 三种受限模式，并共享回滚记录。
 - `graph.py` 已支持审批暂停、批准恢复到 `tool_executor`、拒绝终止，以及写操作专用审计事件。
 - `app.py` 已支持退出码 `2` 的审批暂停提示、`--resume-run <run_id> --approve|--reject`、以及 `--rollback-run <run_id>`。
-- 当前仍未实现：写后自动验证闭环、验证失败后的策略化自动回滚，以及 Planner / Reflector 对写操作的更强约束。
+- `graph.py` 已支持写后必须验证的 Planner / Reflector 闭环；验证失败时可自动回滚，并在 finalizer 中总结验证与回滚结果。
+- 当前仍未实现：更复杂的多轮修复策略、验证命令自动推荐优化，以及更细粒度的回滚策略选择。
 
 ## 2. 范围与非目标
 

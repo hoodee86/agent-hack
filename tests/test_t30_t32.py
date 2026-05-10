@@ -56,6 +56,26 @@ class TestRunStore:
                 "backup_plan": "Backups will be written before overwrite.",
             },
             resume_action=None,
+            pending_verification={
+                "tool": "write_file",
+                "changed_files": ["notes.txt"],
+                "added_lines": 1,
+                "removed_lines": 0,
+                "backup_root": str(tmp_path / ".linux-agent" / "backups" / "run-1"),
+                "manifest_path": str(tmp_path / ".linux-agent" / "backups" / "run-1" / "manifest.json"),
+                "approval_request_id": "approval-1",
+            },
+            last_write={
+                "tool": "write_file",
+                "changed_files": ["notes.txt"],
+                "added_lines": 1,
+                "removed_lines": 0,
+                "backup_root": str(tmp_path / ".linux-agent" / "backups" / "run-1"),
+                "manifest_path": str(tmp_path / ".linux-agent" / "backups" / "run-1" / "manifest.json"),
+                "approval_request_id": "approval-1",
+            },
+            last_verification=None,
+            last_rollback=None,
             iteration_count=0,
             consecutive_failures=0,
             final_answer="Approval required before executing tool 'write_file'.",
@@ -69,6 +89,12 @@ class TestRunStore:
         assert loaded["pending_approval"] is not None
         assert loaded["pending_approval"]["id"] == "approval-1"
         assert loaded["resume_action"] is None
+        assert loaded["pending_verification"] is not None
+        assert loaded["pending_verification"]["changed_files"] == ["notes.txt"]
+        assert loaded["last_write"] is not None
+        assert loaded["last_write"]["approval_request_id"] == "approval-1"
+        assert loaded["last_verification"] is None
+        assert loaded["last_rollback"] is None
         assert len(loaded["messages"]) == 2
         assert isinstance(loaded["messages"][0], HumanMessage)
         assert isinstance(loaded["messages"][1], AIMessage)
@@ -88,6 +114,10 @@ class TestRunStore:
             risk_decision=None,
             pending_approval=None,
             resume_action=None,
+            pending_verification=None,
+            last_write=None,
+            last_verification=None,
+            last_rollback=None,
             iteration_count=0,
             consecutive_failures=0,
             final_answer=None,

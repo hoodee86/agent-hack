@@ -43,6 +43,10 @@ def _initial_state(
         risk_decision=None,
         pending_approval=None,
         resume_action=None,
+        pending_verification=None,
+        last_write=None,
+        last_verification=None,
+        last_rollback=None,
         iteration_count=0,
         consecutive_failures=0,
         final_answer=None,
@@ -463,6 +467,10 @@ class TestGraphSecurityBlocking:
         log_dir = tmp_path / "logs"
         cfg = _make_config(tmp_path, log_dir=log_dir)
         run_id = str(uuid.uuid4())
+        (tmp_path / "test_validation.py").write_text(
+            "def test_validation():\n    assert True\n",
+            encoding="utf-8",
+        )
 
         pause_llm = _stub_llm(
             _tool_turn(
@@ -476,7 +484,15 @@ class TestGraphSecurityBlocking:
         paused_state["run_id"] = run_id
         paused = app.invoke(paused_state)
 
-        resume_llm = _stub_llm(_final_turn("Write completed."))
+        resume_llm = _stub_llm(
+            _final_turn("Write completed."),
+            _tool_turn(
+                "run_command",
+                {"command": "python -m pytest -q", "cwd": "."},
+                content="Run tests for validation",
+            ),
+            _final_turn("Validated and done."),
+        )
         resumed_app = build_graph(cfg, chat_model=resume_llm)
         resumed_state = AgentState(**{**paused, "resume_action": "approve"})  # type: ignore[misc]
 
@@ -485,9 +501,15 @@ class TestGraphSecurityBlocking:
         assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "hello\n"
         assert result["pending_approval"] is None
         assert result["risk_decision"] is None
-        assert result["iteration_count"] == 1
+        assert result["iteration_count"] == 2
+        assert result["pending_verification"] is None
+        assert result["last_verification"] is not None
+        assert result["last_verification"]["ok"] is True
+        assert result["last_rollback"] is None
         assert "Applied file changes:" in (result["final_answer"] or "")
+        assert "Validation result:" in (result["final_answer"] or "")
         assert not state_path(run_id, cfg).exists()
+        assert resume_llm._call_count == 3
 
         import json as _json
 
@@ -496,6 +518,87 @@ class TestGraphSecurityBlocking:
         write_applied = next(event for event in events if event["event"] == "write_applied")
         assert write_applied["data"]["approval_request_id"] == paused["pending_approval"]["id"]
         assert write_applied["data"]["changed_files"] == ["notes.txt"]
+        run_end = [event for event in events if event["event"] == "run_end"][-1]
+        assert run_end["data"]["status"] == "verified_write_completed"
+        assert run_end["data"]["verification_status"] == "passed"
+
+    def test_write_final_answer_without_validation_is_blocked(self, tmp_path: Path) -> None:
+        cfg = _make_config(tmp_path, log_dir=tmp_path / "logs")
+        run_id = str(uuid.uuid4())
+        pause_llm = _stub_llm(
+            _tool_turn(
+                "write_file",
+                {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                content="Create notes.txt",
+            )
+        )
+        app = build_graph(cfg, chat_model=pause_llm)
+        paused_state = _initial_state("Create notes.txt", str(tmp_path))
+        paused_state["run_id"] = run_id
+        paused = app.invoke(paused_state)
+
+        resumed_app = build_graph(cfg, chat_model=_stub_llm(_final_turn("Write completed.")))
+        resumed_state = AgentState(**{**paused, "resume_action": "approve"})  # type: ignore[misc]
+
+        result = resumed_app.invoke(resumed_state)
+
+        assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "hello\n"
+        assert result["pending_verification"] is not None
+        assert result["last_verification"] is None
+        assert "stopped before validating" in (result["final_answer"] or "").lower()
+        assert "Validation still required:" in (result["final_answer"] or "")
+
+    def test_failed_validation_auto_rolls_back_recent_write(self, tmp_path: Path) -> None:
+        log_dir = tmp_path / "logs"
+        cfg = _make_config(tmp_path, log_dir=log_dir, auto_rollback_on_verify_failure=True)
+        run_id = str(uuid.uuid4())
+        (tmp_path / "test_failure.py").write_text(
+            "def test_failure():\n    assert False\n",
+            encoding="utf-8",
+        )
+
+        pause_llm = _stub_llm(
+            _tool_turn(
+                "write_file",
+                {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                content="Create notes.txt",
+            )
+        )
+        app = build_graph(cfg, chat_model=pause_llm)
+        paused_state = _initial_state("Create notes.txt", str(tmp_path))
+        paused_state["run_id"] = run_id
+        paused = app.invoke(paused_state)
+
+        resume_llm = _stub_llm(
+            _tool_turn(
+                "run_command",
+                {"command": "python -m pytest -q", "cwd": "."},
+                content="Run tests for validation",
+            )
+        )
+        resumed_app = build_graph(cfg, chat_model=resume_llm)
+        resumed_state = AgentState(**{**paused, "resume_action": "approve"})  # type: ignore[misc]
+
+        result = resumed_app.invoke(resumed_state)
+
+        assert not (tmp_path / "notes.txt").exists()
+        assert result["pending_verification"] is None
+        assert result["last_verification"] is not None
+        assert result["last_verification"]["ok"] is False
+        assert result["last_rollback"] is not None
+        assert result["last_rollback"]["ok"] is True
+        assert result["last_rollback"]["trigger"] == "verify_failure"
+        assert "rolled back automatically" in (result["final_answer"] or "")
+        assert "Rollback result:" in (result["final_answer"] or "")
+
+        import json as _json
+
+        events = [_json.loads(line) for line in (log_dir / f"{run_id}.jsonl").read_text().splitlines() if line]
+        write_rollback = next(event for event in events if event["event"] == "write_rollback")
+        assert write_rollback["data"]["trigger"] == "verify_failure"
+        run_end = [event for event in events if event["event"] == "run_end"][-1]
+        assert run_end["data"]["status"] == "rolled_back_after_failed_verification"
+        assert run_end["data"]["verification_status"] == "failed"
 
     def test_rejected_resume_skips_write_execution(self, tmp_path: Path) -> None:
         cfg = _make_config(tmp_path, log_dir=tmp_path / "logs")
@@ -521,6 +624,7 @@ class TestGraphSecurityBlocking:
         assert result["iteration_count"] == 0
         assert result["observations"] == []
         assert "rejected approval request" in (result["final_answer"] or "").lower()
+        assert "narrower manual change" in (result["final_answer"] or "").lower()
         assert not state_path(run_id, cfg).exists()
 
 

@@ -57,6 +57,44 @@ class ApprovalRequest(TypedDict):
     backup_plan: str | None
 
 
+class WriteSummary(TypedDict):
+    """Metadata for the latest successfully applied write operation."""
+
+    tool: Literal["apply_patch", "write_file"]
+    changed_files: list[str]
+    added_lines: int
+    removed_lines: int
+    backup_root: str | None
+    manifest_path: str | None
+    approval_request_id: str | None
+
+
+class VerificationSummary(TypedDict):
+    """Summary of the command used to verify a recent write."""
+
+    command: str
+    cwd: str
+    ok: bool
+    exit_code: int | None
+    timed_out: bool
+    truncated: bool
+    stdout_preview: str | None
+    stderr_preview: str | None
+
+
+class RollbackSummary(TypedDict):
+    """Result of restoring files from the per-run backup manifest."""
+
+    ok: bool
+    run_id: str
+    manifest_path: str | None
+    backup_root: str | None
+    restored_files: list[str]
+    removed_files: list[str]
+    error: str | None
+    trigger: Literal["manual", "verify_failure"]
+
+
 class AgentState(TypedDict):
     """
     Full mutable state threaded through the LangGraph state machine.
@@ -97,6 +135,18 @@ class AgentState(TypedDict):
 
     # Set only when a paused run is resumed from the CLI.
     resume_action: Literal["approve", "reject"] | None
+
+    # Populated after a successful write until a verification command runs.
+    pending_verification: WriteSummary | None
+
+    # The latest successfully applied write, regardless of verification outcome.
+    last_write: WriteSummary | None
+
+    # Summary of the latest verification command run after a write.
+    last_verification: VerificationSummary | None
+
+    # Populated when a write is rolled back manually or after failed validation.
+    last_rollback: RollbackSummary | None
 
     # Total number of tool executions so far (incremented by Tool Executor)
     iteration_count: int

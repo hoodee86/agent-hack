@@ -72,8 +72,15 @@ from linux_agent.run_store import delete_run_state, save_run_state
 from linux_agent.skills.filesystem import list_dir, read_file
 from linux_agent.skills.search import search_text
 from linux_agent.skills.shell import run_command
-from linux_agent.skills.write import apply_patch, write_file
-from linux_agent.state import AgentState, Observation, ToolCall
+from linux_agent.skills.write import apply_patch, rollback_run, write_file
+from linux_agent.state import (
+    AgentState,
+    Observation,
+    RollbackSummary,
+    ToolCall,
+    VerificationSummary,
+    WriteSummary,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,15 +177,30 @@ All paths and working directories must stay within the workspace root.
     build diagnostics, or git status/diff.
 - Use apply_patch and write_file only when a file change is necessary to complete the goal.
 - Keep write requests narrow, text-only, and limited to the workspace.
+- Before proposing a write, gather enough evidence from read_file/search_text/list_dir to justify the exact change.
 - Never request shell control syntax such as pipes, redirection, chaining, background
     execution, or shell wrappers.
 - Call at most one tool at a time.
 - If a write tool is required, explain the intended change clearly so the approval summary is useful.
+- After any successful write, you MUST call run_command with a narrow validation command before giving a final answer.
+- If validation fails, inspect the failure output and either propose another narrow fix or explain the rollback path; never claim success.
 - After a command fails, inspect the referenced files or error locations before retrying.
 - Answer in plain text when you already have enough information.
 - Do not invent files, directories, file contents, command outputs, or test results.
 - Keep tool arguments minimal and precise.
 """
+
+_WRITE_TOOL_NAMES: frozenset[str] = frozenset({"apply_patch", "write_file"})
+_VALIDATION_COMMAND_KEYWORDS: tuple[str, ...] = (
+    "pytest",
+    "mypy",
+    "ruff",
+    "test",
+    "check",
+    "build",
+    "compile",
+)
+_NON_VALIDATING_COMMAND_PREFIXES: tuple[str, ...] = ("git", "ls", "pwd", "find", "rg")
 
 
 def _fmt_observations(observations: list[Observation], n: int = 5) -> str:
@@ -402,6 +424,188 @@ def _tool_result_audit_payload(tool_call: ToolCall, obs: Observation) -> dict[st
     return payload
 
 
+def _build_write_summary(
+    tool_name: str,
+    result: dict[str, Any],
+    *,
+    approval_request_id: str | None,
+) -> WriteSummary:
+    raw_changed_files = result.get("changed_files")
+    changed_files = (
+        [str(path) for path in raw_changed_files]
+        if isinstance(raw_changed_files, list)
+        else []
+    )
+    return {
+        "tool": cast("Literal['apply_patch', 'write_file']", tool_name),
+        "changed_files": changed_files,
+        "added_lines": int(result.get("added_lines", 0) or 0),
+        "removed_lines": int(result.get("removed_lines", 0) or 0),
+        "backup_root": cast(str | None, result.get("backup_root")),
+        "manifest_path": cast(str | None, result.get("manifest_path")),
+        "approval_request_id": approval_request_id,
+    }
+
+
+def _build_verification_summary(result: dict[str, Any], *, ok: bool) -> VerificationSummary:
+    return {
+        "command": str(result.get("command", "(unknown)")),
+        "cwd": str(result.get("cwd", ".")),
+        "ok": ok,
+        "exit_code": cast(int | None, result.get("exit_code")),
+        "timed_out": bool(result.get("timed_out", False)),
+        "truncated": bool(result.get("truncated", False)),
+        "stdout_preview": _preview_text(result.get("stdout"), limit=400),
+        "stderr_preview": _preview_text(result.get("stderr"), limit=400),
+    }
+
+
+def _build_rollback_summary(
+    rollback_result: dict[str, Any],
+    *,
+    trigger: str,
+) -> RollbackSummary:
+    raw_restored = rollback_result.get("restored_files")
+    raw_removed = rollback_result.get("removed_files")
+    restored_files = [str(path) for path in raw_restored] if isinstance(raw_restored, list) else []
+    removed_files = [str(path) for path in raw_removed] if isinstance(raw_removed, list) else []
+    return {
+        "ok": bool(rollback_result.get("ok", False)),
+        "run_id": str(rollback_result.get("run_id", "")),
+        "manifest_path": cast(str | None, rollback_result.get("manifest_path")),
+        "backup_root": cast(str | None, rollback_result.get("backup_root")),
+        "restored_files": restored_files,
+        "removed_files": removed_files,
+        "error": cast(str | None, rollback_result.get("error")),
+        "trigger": cast("Literal['manual', 'verify_failure']", trigger),
+    }
+
+
+def _is_validation_command(result: dict[str, Any]) -> bool:
+    raw_command = result.get("command")
+    if not isinstance(raw_command, str) or not raw_command.strip():
+        return False
+
+    try:
+        argv = [part.lower() for part in parse_command(raw_command)]
+    except PolicyViolation:
+        argv = [part.lower() for part in raw_command.split() if part.strip()]
+
+    if not argv:
+        return False
+
+    prefix = argv[0]
+    if prefix in _NON_VALIDATING_COMMAND_PREFIXES:
+        return False
+
+    joined = " ".join(argv)
+    return any(keyword in joined for keyword in _VALIDATION_COMMAND_KEYWORDS)
+
+
+def _format_pending_verification(state: AgentState) -> str:
+    pending = state.get("pending_verification")
+    if pending is not None:
+        changed = ", ".join(pending["changed_files"][:5]) or "(unknown files)"
+        lines = [
+            "A recent write was applied but has not been verified yet.",
+            f"Changed files: {changed}",
+            f"Added/removed lines: +{pending['added_lines']}/-{pending['removed_lines']}",
+            "You MUST call run_command next with a narrow validation command such as tests, lint, type checks, or build verification.",
+            "Do not answer in plain text until validation finishes.",
+        ]
+        if pending.get("backup_root"):
+            lines.append(f"Backup root: {pending['backup_root']}")
+        if pending.get("manifest_path"):
+            lines.append(f"Manifest path: {pending['manifest_path']}")
+        return "\n".join(lines)
+
+    last_verification = state.get("last_verification")
+    last_write = state.get("last_write")
+    last_rollback = state.get("last_rollback")
+    if last_verification is not None and last_write is not None:
+        changed = ", ".join(last_write["changed_files"][:5]) or "(unknown files)"
+        lines = [f"Latest write touched: {changed}."]
+        if last_verification["ok"]:
+            lines.append(
+                f"Latest validation passed via '{last_verification['command']}' (exit {last_verification['exit_code']})."
+            )
+            return "\n".join(lines)
+
+        lines.append(
+            f"Latest validation failed via '{last_verification['command']}' (exit {last_verification['exit_code']})."
+        )
+        if last_rollback is not None and last_rollback.get("ok"):
+            lines.append("The failed write has already been rolled back.")
+        else:
+            lines.append(
+                "Inspect the failure output and either propose another narrow fix or explicitly explain the rollback path before claiming success."
+            )
+            if last_write.get("manifest_path"):
+                lines.append(f"Rollback manifest: {last_write['manifest_path']}")
+        return "\n".join(lines)
+
+    return "No pending write verification."
+
+
+def _verification_retry_message(write_summary: WriteSummary) -> str:
+    changed = ", ".join(write_summary["changed_files"][:5]) or "(unknown files)"
+    return (
+        "Recent file changes are still unverified.\n"
+        f"Changed files: {changed}\n"
+        "Call run_command next with a narrow validation command such as tests, lint, type checks, or build verification.\n"
+        "Do not answer in plain text until validation completes."
+    )
+
+
+def _build_unverified_write_answer(write_summary: WriteSummary) -> str:
+    changed = ", ".join(write_summary["changed_files"][:5]) or "(unknown files)"
+    lines = [
+        "Agent stopped before validating the latest file changes.",
+        f"Changed files: {changed}",
+        "Run a validation command before treating this write as complete.",
+    ]
+    if write_summary.get("backup_root"):
+        lines.append(f"Backup root: {write_summary['backup_root']}")
+    if write_summary.get("manifest_path"):
+        lines.append(f"Manifest path: {write_summary['manifest_path']}")
+    return "\n".join(lines)
+
+
+def _build_validation_failure_answer(
+    write_summary: WriteSummary,
+    verification: VerificationSummary,
+    rollback_summary: RollbackSummary | None,
+) -> str:
+    changed = ", ".join(write_summary["changed_files"][:5]) or "(unknown files)"
+    lines = [
+        "Validation failed after applying file changes.",
+        f"Changed files: {changed}",
+        f"Validation command: {verification['command']} [cwd={verification['cwd']}]",
+    ]
+    if verification["exit_code"] is not None:
+        lines.append(f"Exit code: {verification['exit_code']}")
+    if verification.get("stderr_preview"):
+        lines.append(f"stderr preview: {verification['stderr_preview']}")
+    elif verification.get("stdout_preview"):
+        lines.append(f"stdout preview: {verification['stdout_preview']}")
+
+    if rollback_summary is not None and rollback_summary["ok"]:
+        lines.append("The write was rolled back automatically after the failed validation command.")
+        if rollback_summary["restored_files"]:
+            lines.append(
+                "Restored files: " + ", ".join(rollback_summary["restored_files"])
+            )
+        if rollback_summary["removed_files"]:
+            lines.append(
+                "Removed files: " + ", ".join(rollback_summary["removed_files"])
+            )
+    else:
+        lines.append("Rollback is still available if you want to restore the previous state.")
+        if write_summary.get("manifest_path"):
+            lines.append(f"Rollback manifest: {write_summary['manifest_path']}")
+    return "\n".join(lines)
+
+
 def _classify_tool_risk(
     name: str,
     args: dict[str, object],
@@ -444,11 +648,13 @@ def _format_planner_prompt(state: AgentState, config: AgentConfig) -> str:
         or "  (not yet planned)"
     )
     obs_text = _fmt_observations(state["observations"])
+    write_text = _format_pending_verification(state)
     return (
         f"Goal: {state['user_goal']}\n\n"
         f"Workspace root: {state['workspace_root']}\n\n"
         f"Current plan:\n{plan_text}\n\n"
         f"Recent observations:\n{obs_text}\n\n"
+        f"Write verification status:\n{write_text}\n\n"
         f"Iterations used: {state['iteration_count']} / {config.max_iterations}\n"
         f"Consecutive failures: {state['consecutive_failures']} / "
         f"{config.max_consecutive_failures}"
@@ -718,32 +924,56 @@ def _make_planner(
     """Return a Planner node function closed over *config* and *llm*."""
     llm_with_tools = _bind_model_tools(llm)
 
+    def _invoke_planner_messages(
+        run_id: str,
+        messages: list[BaseMessage],
+        *,
+        retry_reason: str | None = None,
+    ) -> AIMessage:
+        payload: dict[str, Any] = {
+            "message_count": len(messages),
+            "messages": [_serialize_trace_message(message) for message in messages],
+        }
+        if retry_reason is not None:
+            payload["retry_reason"] = retry_reason
+        _emit_runtime_event(
+            run_id,
+            EVENT_MODEL_INPUT,
+            payload,
+            prompt_trace_listener,
+        )
+        return _coerce_ai_message(llm_with_tools.invoke(messages))
+
     def planner(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
         prompt_message = HumanMessage(content=_format_planner_prompt(state, config))
         history: list[BaseMessage] = state["messages"]
         request_messages = [SystemMessage(content=_SYSTEM_PROMPT), *history, prompt_message]
-        _emit_runtime_event(
-            run_id,
-            EVENT_MODEL_INPUT,
-            {
-                "message_count": len(request_messages),
-                "messages": [_serialize_trace_message(message) for message in request_messages],
-            },
-            prompt_trace_listener,
-        )
-        raw = llm_with_tools.invoke(request_messages)
-        response = _coerce_ai_message(raw)
+        response = _invoke_planner_messages(run_id, request_messages)
         tool_call = _build_tool_call(response, state, config)
+
+        pending_verification = state.get("pending_verification")
+        if pending_verification is not None and tool_call is None:
+            reminder = HumanMessage(content=_verification_retry_message(pending_verification))
+            response = _invoke_planner_messages(
+                run_id,
+                [*request_messages, response, reminder],
+                retry_reason="pending_write_verification",
+            )
+            tool_call = _build_tool_call(response, state, config)
+
         assistant_content = _content_to_text(response.content)
         current_step = _summarize_step(response, tool_call)
         plan = _append_plan_step(state["plan"], current_step)
 
         final_answer: str | None = None
         if tool_call is None:
-            final_answer = _content_to_text(response.content) or (
-                "Agent returned neither a tool call nor a final answer."
-            )
+            if pending_verification is not None:
+                final_answer = _build_unverified_write_answer(pending_verification)
+            else:
+                final_answer = _content_to_text(response.content) or (
+                    "Agent returned neither a tool call nor a final answer."
+                )
 
         # ── Audit ────────────────────────────────────────────────────────
         _one_shot_audit(
@@ -922,7 +1152,8 @@ def _make_resume_gate(config: AgentConfig) -> Callable[[AgentState], dict[str, A
             "proposed_tool_call": None,
             "final_answer": (
                 f"User rejected approval request '{approval_request['id']}' for tool "
-                f"'{tool_call['name']}'. No changes were applied."
+                f"'{tool_call['name']}'. No changes were applied. "
+                "Inspect additional context and propose a narrower manual change if needed."
             ),
         }
 
@@ -1068,7 +1299,7 @@ def _make_tool_executor(
         # Reset consecutive_failures on success; increment on failure
         new_failures = 0 if obs["ok"] else state["consecutive_failures"] + 1
 
-        return {
+        state_update: dict[str, Any] = {
             "messages": [
                 ToolMessage(
                     content=_serialize_tool_payload(obs),
@@ -1083,6 +1314,34 @@ def _make_tool_executor(
             "resume_action": None,
             "proposed_tool_call": None,
         }
+
+        if obs["tool"] in _WRITE_TOOL_NAMES and obs["ok"] and isinstance(result, dict):
+            state_update.update(
+                {
+                    "last_write": _build_write_summary(
+                        obs["tool"],
+                        result,
+                        approval_request_id=(
+                            state["pending_approval"]["id"]
+                            if state.get("pending_approval") is not None
+                            else None
+                        ),
+                    ),
+                    "pending_verification": _build_write_summary(
+                        obs["tool"],
+                        result,
+                        approval_request_id=(
+                            state["pending_approval"]["id"]
+                            if state.get("pending_approval") is not None
+                            else None
+                        ),
+                    ),
+                    "last_verification": None,
+                    "last_rollback": None,
+                }
+            )
+
+        return state_update
 
     return tool_executor
 
@@ -1138,6 +1397,116 @@ def _make_reflector(
                 ):
                     return {"final_answer": _build_command_timeout_answer(last_obs)}
 
+        pending_verification = state.get("pending_verification")
+        if last_obs is not None and pending_verification is not None:
+            if last_obs["tool"] in _WRITE_TOOL_NAMES and last_obs["ok"]:
+                _one_shot_audit(
+                    run_id,
+                    config.log_dir,
+                    EVENT_REFLECTOR_ACTION,
+                    {
+                        "reason": "write_requires_verification",
+                        "action": "run_validation_command",
+                        "changed_files": pending_verification["changed_files"],
+                        "backup_root": pending_verification["backup_root"],
+                        "manifest_path": pending_verification["manifest_path"],
+                        "guidance": (
+                            "Run a narrow validation command before finalizing any answer about the recent file change."
+                        ),
+                    },
+                    event_listener,
+                )
+            elif last_obs["tool"] == "run_command" and isinstance(last_obs.get("result"), dict):
+                command_result = cast(dict[str, Any], last_obs["result"])
+                if _is_validation_command(command_result):
+                    verification = _build_verification_summary(command_result, ok=last_obs["ok"])
+                    if verification["ok"]:
+                        _one_shot_audit(
+                            run_id,
+                            config.log_dir,
+                            EVENT_REFLECTOR_ACTION,
+                            {
+                                "reason": "write_validation_passed",
+                                "action": "finalize_after_verified_write",
+                                "command": verification["command"],
+                                "changed_files": pending_verification["changed_files"],
+                            },
+                            event_listener,
+                        )
+                        return {
+                            "pending_verification": None,
+                            "last_verification": verification,
+                            "last_rollback": None,
+                        }
+
+                    rollback_summary: RollbackSummary | None = None
+                    if config.auto_rollback_on_verify_failure:
+                        rollback_result = rollback_run(state["run_id"], config)
+                        rollback_summary = _build_rollback_summary(
+                            rollback_result,
+                            trigger="verify_failure",
+                        )
+                        _one_shot_audit(
+                            run_id,
+                            config.log_dir,
+                            EVENT_WRITE_ROLLBACK,
+                            {
+                                "tool": "rollback_run",
+                                "trigger": "verify_failure",
+                                "approval_request_id": pending_verification["approval_request_id"],
+                                **rollback_summary,
+                            },
+                            event_listener,
+                        )
+
+                    _one_shot_audit(
+                        run_id,
+                        config.log_dir,
+                        EVENT_REFLECTOR_ACTION,
+                        {
+                            "reason": "write_validation_failed",
+                            "action": (
+                                "auto_rollback"
+                                if config.auto_rollback_on_verify_failure
+                                else "inspect_failure_context"
+                            ),
+                            "command": verification["command"],
+                            "exit_code": verification["exit_code"],
+                            "stderr_preview": verification["stderr_preview"],
+                            "stdout_preview": verification["stdout_preview"],
+                            "changed_files": pending_verification["changed_files"],
+                        },
+                        event_listener,
+                    )
+
+                    state_update: dict[str, Any] = {
+                        "pending_verification": None,
+                        "last_verification": verification,
+                        "last_rollback": rollback_summary,
+                    }
+                    if rollback_summary is not None:
+                        state_update["final_answer"] = _build_validation_failure_answer(
+                            pending_verification,
+                            verification,
+                            rollback_summary,
+                        )
+                    return state_update
+
+                _one_shot_audit(
+                    run_id,
+                    config.log_dir,
+                    EVENT_REFLECTOR_ACTION,
+                    {
+                        "reason": "write_validation_still_required",
+                        "action": "run_validation_command",
+                        "command": command_result.get("command"),
+                        "guidance": (
+                            "The latest command does not look like a validation step. Run tests, lint, or type checks before finalizing the recent write."
+                        ),
+                    },
+                    event_listener,
+                )
+
         # Circuit-breaker: consecutive failure limit
         if state["consecutive_failures"] >= config.max_consecutive_failures:
             last_err = (
@@ -1181,10 +1550,53 @@ def _make_finalizer(
         final = state.get("final_answer") or "(no answer produced)"
         command_summaries = _command_summary_lines(state["observations"])
         write_summaries = _write_summary_lines(state["observations"])
+        last_verification = state.get("last_verification")
+        last_rollback = state.get("last_rollback")
+        pending_verification = state.get("pending_verification")
         if command_summaries and "Executed commands:" not in final:
             final = f"{final}\n\nExecuted commands:\n" + "\n".join(command_summaries)
         if write_summaries and "Applied file changes:" not in final:
             final = f"{final}\n\nApplied file changes:\n" + "\n".join(write_summaries)
+        if pending_verification is not None and "Validation still required:" not in final:
+            changed = ", ".join(pending_verification["changed_files"][:5]) or "(unknown files)"
+            validation_lines = [
+                f"Recent write remains unverified for: {changed}",
+            ]
+            if pending_verification.get("backup_root"):
+                validation_lines.append(f"Backup root: {pending_verification['backup_root']}")
+            if pending_verification.get("manifest_path"):
+                validation_lines.append(f"Manifest path: {pending_verification['manifest_path']}")
+            final = f"{final}\n\nValidation still required:\n" + "\n".join(validation_lines)
+        if last_verification is not None and "Validation result:" not in final:
+            validation_lines = [
+                f"Command: {last_verification['command']} [cwd={last_verification['cwd']}]",
+                f"Status: {'passed' if last_verification['ok'] else 'failed'}",
+            ]
+            if last_verification["exit_code"] is not None:
+                validation_lines.append(f"Exit code: {last_verification['exit_code']}")
+            if last_verification.get("stderr_preview"):
+                validation_lines.append(f"stderr preview: {last_verification['stderr_preview']}")
+            elif last_verification.get("stdout_preview"):
+                validation_lines.append(f"stdout preview: {last_verification['stdout_preview']}")
+            final = f"{final}\n\nValidation result:\n" + "\n".join(validation_lines)
+        if last_rollback is not None and "Rollback result:" not in final:
+            rollback_lines = [
+                f"Trigger: {last_rollback['trigger']}",
+                f"Status: {'ok' if last_rollback['ok'] else 'failed'}",
+            ]
+            if last_rollback["restored_files"]:
+                rollback_lines.append(
+                    "Restored files: " + ", ".join(last_rollback["restored_files"])
+                )
+            if last_rollback["removed_files"]:
+                rollback_lines.append(
+                    "Removed files: " + ", ".join(last_rollback["removed_files"])
+                )
+            if last_rollback.get("manifest_path"):
+                rollback_lines.append(f"Manifest path: {last_rollback['manifest_path']}")
+            if last_rollback.get("error"):
+                rollback_lines.append(f"Error: {last_rollback['error']}")
+            final = f"{final}\n\nRollback result:\n" + "\n".join(rollback_lines)
 
         if state.get("risk_decision") == "needs_approval":
             status = "paused_for_approval"
@@ -1192,6 +1604,14 @@ def _make_finalizer(
             status = "approval_rejected"
         elif state.get("risk_decision") == "deny":
             status = "denied"
+        elif last_rollback is not None and last_verification is not None and not last_verification["ok"]:
+            status = "rolled_back_after_failed_verification"
+        elif last_verification is not None and not last_verification["ok"]:
+            status = "verification_failed"
+        elif last_verification is not None and last_verification["ok"]:
+            status = "verified_write_completed"
+        elif pending_verification is not None:
+            status = "completed_with_unverified_write"
         else:
             status = "completed"
 
@@ -1208,6 +1628,18 @@ def _make_finalizer(
                 "command_summaries": command_summaries,
                 "write_count": len(write_summaries),
                 "write_summaries": write_summaries,
+                "verification_status": (
+                    None
+                    if last_verification is None
+                    else ("passed" if last_verification["ok"] else "failed")
+                ),
+                "verification_command": (
+                    last_verification["command"] if last_verification is not None else None
+                ),
+                "verification_exit_code": (
+                    last_verification["exit_code"] if last_verification is not None else None
+                ),
+                "rollback_result": last_rollback,
                 "approval_request_id": (
                     state["pending_approval"]["id"]
                     if state.get("pending_approval") is not None
@@ -1307,6 +1739,10 @@ def build_graph(
             "risk_decision": None,
             "pending_approval": None,
             "resume_action": None,
+            "pending_verification": None,
+            "last_write": None,
+            "last_verification": None,
+            "last_rollback": None,
             "iteration_count": 0,
             "consecutive_failures": 0,
             "final_answer": None,

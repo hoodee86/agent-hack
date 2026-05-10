@@ -39,6 +39,10 @@ def _initial_state(goal: str, workspace_root: str) -> AgentState:
         risk_decision=None,
         pending_approval=None,
         resume_action=None,
+        pending_verification=None,
+        last_write=None,
+        last_verification=None,
+        last_rollback=None,
         iteration_count=0,
         consecutive_failures=0,
         final_answer=None,
@@ -461,6 +465,47 @@ class TestScenarioIterationLimit:
         assert all(not o["ok"] for o in result["observations"])
 
 
+class TestScenarioVerifiedWrite:
+    def test_write_resume_then_validation_command(self, tmp_path: Path) -> None:
+        (tmp_path / "test_ok.py").write_text(
+            "def test_ok():\n    assert True\n",
+            encoding="utf-8",
+        )
+        cfg = _make_config(tmp_path, log_dir=tmp_path / "logs")
+        run_id = str(uuid.uuid4())
+
+        pause_llm = _stub(
+            _tool_turn(
+                "write_file",
+                {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                content="Create notes.txt",
+            )
+        )
+        paused_app = build_graph(cfg, chat_model=pause_llm)
+        paused_state = _initial_state("Create notes.txt", str(tmp_path))
+        paused_state["run_id"] = run_id
+        paused = paused_app.invoke(paused_state)
+
+        resume_llm = _stub(
+            _tool_turn(
+                "run_command",
+                {"command": "python -m pytest -q", "cwd": "."},
+                content="Run validation tests",
+            ),
+            _final_turn("Validated."),
+        )
+        resumed_app = build_graph(cfg, chat_model=resume_llm)
+        resumed_state = AgentState(**{**paused, "resume_action": "approve"})  # type: ignore[misc]
+
+        result = resumed_app.invoke(resumed_state)
+
+        assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "hello\n"
+        assert result["pending_verification"] is None
+        assert result["last_verification"] is not None
+        assert result["last_verification"]["ok"] is True
+        assert "Validation result:" in (result["final_answer"] or "")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Scenario 7 – audit log completeness
 # ─────────────────────────────────────────────────────────────────────────────
@@ -491,6 +536,10 @@ class TestScenarioAuditLog:
             risk_decision=None,
             pending_approval=None,
             resume_action=None,
+            pending_verification=None,
+            last_write=None,
+            last_verification=None,
+            last_rollback=None,
             iteration_count=0,
             consecutive_failures=0,
             final_answer=None,

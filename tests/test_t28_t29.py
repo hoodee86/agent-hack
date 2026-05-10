@@ -307,6 +307,19 @@ class TestWriteFile:
         assert result["ok"] is False
         assert result["error"] == "binary files are not supported"
 
+    def test_write_file_rejects_symlink_target_escaping_workspace(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "outside.txt"
+        outside.write_text("secret\n", encoding="utf-8")
+        link = tmp_path / "link.txt"
+        link.symlink_to(outside)
+        config = make_config(tmp_path)
+
+        result = write_file("link.txt", "changed\n", config, mode="overwrite")
+
+        assert result["ok"] is False
+        assert "escapes workspace root" in result["error"]
+        assert outside.read_text(encoding="utf-8") == "secret\n"
+
     def test_write_file_rejects_oversized_content(self, tmp_path: Path) -> None:
         (tmp_path / "docs").mkdir()
         config = make_config(tmp_path, max_patch_bytes=16)

@@ -514,6 +514,14 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                 _print_field(stream, "Writes", data.get("write_count"), use_color=use_color, inline=True)
             if data.get("write_summaries"):
                 _print_field(stream, "Write Summaries", data.get("write_summaries"), use_color=use_color)
+            if data.get("verification_status") is not None:
+                _print_field(stream, "Verification", data.get("verification_status"), use_color=use_color, inline=True)
+            if data.get("verification_command") is not None:
+                _print_field(stream, "Verification Command", data.get("verification_command"), use_color=use_color)
+            if data.get("verification_exit_code") is not None:
+                _print_field(stream, "Verification Exit Code", data.get("verification_exit_code"), use_color=use_color, inline=True)
+            if data.get("rollback_result") is not None:
+                _print_field(stream, "Rollback Result", data.get("rollback_result"), use_color=use_color)
             _print_field(stream, "Final Answer", data.get("final_answer"), use_color=use_color)
         else:
             _print_field(stream, "Data", data, use_color=use_color)
@@ -683,6 +691,10 @@ def main(argv: list[str] | None = None) -> int:
             risk_decision=None,
             pending_approval=None,
             resume_action=None,
+            pending_verification=None,
+            last_write=None,
+            last_verification=None,
+            last_rollback=None,
             iteration_count=0,
             consecutive_failures=0,
             final_answer=None,
