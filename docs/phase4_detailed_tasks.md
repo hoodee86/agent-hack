@@ -11,7 +11,8 @@
 **当前实现状态（2026-05-10）**：
 
 - T18-T35 已完成。
-- T36-T44 未开始。
+- T36 已完成。
+- T37-T44 未开始。
 
 本文默认遵循以下原则：
 
@@ -85,7 +86,7 @@ T44 阶段 4 验收与文档收口
 
 ## 阶段 4 任务拆解
 
-### T36 — 配置与状态扩展（预算 / 评分 / 恢复元数据）
+### T36 — 配置与状态扩展（预算 / 评分 / 恢复元数据） 已完成
 
 **文件**：`src/linux_agent/config.py`、`src/linux_agent/state.py`、必要时 `src/linux_agent/run_store.py`
 
@@ -143,6 +144,13 @@ class BudgetStatus(TypedDict):
 - `load_config()` 能在不破坏现有阶段 1-3 行为的前提下，返回完整阶段 4 配置。
 - `AgentState` 可以表达计划修订、恢复尝试和预算状态。
 - 暂停审批后的恢复运行不会丢失预算与恢复计数。
+
+**实现结果（2026-05-10）**：
+
+- `AgentConfig` 已新增阶段 4 所需预算、反思阈值和审批 UI 配置字段，并补充阈值一致性校验。
+- `AgentState` 已新增 `started_at`、`command_count`、`plan_version`、`plan_revision_count`、`plan_steps`、`last_reflection`、`recovery_state`、`budget_status`、`budget_stop_reason`。
+- `run_store.py` 已支持这些字段的持久化与恢复，并对旧快照缺失字段执行保守回填。
+- 已新增 T36 回归测试，覆盖默认值、YAML 覆盖、legacy state 回填和新元数据 round-trip。
 
 ### T37 — Planner 计划更新与步骤生命周期
 

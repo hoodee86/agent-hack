@@ -27,6 +27,7 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import sys
@@ -683,8 +684,22 @@ def main(argv: list[str] | None = None) -> int:
             run_id=run_id,
             user_goal=args.goal,
             workspace_root=str(config.workspace_root),
+            started_at=dt.datetime.now(dt.timezone.utc).isoformat(),
             messages=[],
             plan=[],
+            command_count=0,
+            plan_version=0,
+            plan_revision_count=0,
+            plan_steps=[],
+            last_reflection=None,
+            recovery_state=None,
+            budget_status={
+                "iteration_count": 0,
+                "command_count": 0,
+                "elapsed_seconds": 0,
+                "warning_triggered": False,
+            },
+            budget_stop_reason=None,
             current_step=None,
             proposed_tool_call=None,
             observations=[],

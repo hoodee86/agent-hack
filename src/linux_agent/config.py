@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -39,6 +39,22 @@ class AgentConfig(BaseModel):
     # --- Command execution limits ---------------------------------------
     # Default timeout applied by run_command when the caller omits one
     default_timeout_seconds: int = Field(default=120, ge=1)
+    # Hard limit on how many shell commands a run may execute in total.
+    max_command_count: int = Field(default=8, ge=1)
+    # Hard cap on total wall-clock runtime for a single run.
+    max_runtime_seconds: int = Field(default=900, ge=1)
+    # Maximum number of plan revisions allowed before the run must stop.
+    max_plan_revisions: int = Field(default=3, ge=0)
+    # Maximum automatic recovery attempts per distinct failure fingerprint.
+    max_recovery_attempts_per_issue: int = Field(default=2, ge=0)
+    # Emit a budget warning once this fraction of a limit has been consumed.
+    budget_warning_ratio: float = Field(default=0.8, gt=0.0, le=1.0)
+    # Reflection scores at or below this value should trigger replanning.
+    reflection_replan_threshold: int = Field(default=60, ge=0, le=100)
+    # Reflection scores at or below this value should stop the run.
+    reflection_stop_threshold: int = Field(default=30, ge=0, le=100)
+    # How much approval detail the CLI should render once phase 4 lands.
+    approval_ui_mode: Literal["compact", "detailed"] = "compact"
     # Maximum bytes returned for stdout before truncation
     max_output_bytes: int = Field(default=65536, ge=1)
     # Maximum bytes returned for stderr before truncation
@@ -202,6 +218,11 @@ class AgentConfig(BaseModel):
         if not self.workspace_root.is_dir():
             raise ValueError(
                 f"workspace_root is not a directory: {self.workspace_root}"
+            )
+        if self.reflection_stop_threshold > self.reflection_replan_threshold:
+            raise ValueError(
+                "reflection_stop_threshold must be less than or equal to "
+                "reflection_replan_threshold"
             )
         return self
 

@@ -12,7 +12,56 @@ from linux_agent.config import AgentConfig
 from linux_agent.state import AgentState
 
 _STATE_DIRNAME = "state"
-_STATE_VERSION = 1
+_STATE_VERSION = 2
+
+
+def _default_plan_steps(
+    plan: list[str],
+    current_step: str | None,
+) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    for index, title in enumerate(plan, start=1):
+        status = "in_progress" if current_step and title == current_step else "pending"
+        steps.append(
+            {
+                "id": f"step_{index}",
+                "title": title,
+                "status": status,
+                "rationale": None,
+                "evidence_refs": [],
+            }
+        )
+    return steps
+
+
+def _normalize_budget_status(
+    raw_budget_status: Any,
+    *,
+    iteration_count: int,
+    command_count: int,
+) -> dict[str, Any]:
+    budget_status = {
+        "iteration_count": iteration_count,
+        "command_count": command_count,
+        "elapsed_seconds": 0,
+        "warning_triggered": False,
+    }
+    if isinstance(raw_budget_status, dict):
+        budget_status.update(
+            {
+                "iteration_count": int(
+                    raw_budget_status.get("iteration_count", iteration_count)
+                ),
+                "command_count": int(
+                    raw_budget_status.get("command_count", command_count)
+                ),
+                "elapsed_seconds": int(raw_budget_status.get("elapsed_seconds", 0)),
+                "warning_triggered": bool(
+                    raw_budget_status.get("warning_triggered", False)
+                ),
+            }
+        )
+    return budget_status
 
 
 def _serialize_message(message: BaseMessage) -> dict[str, Any]:
@@ -76,13 +125,39 @@ def load_run_state(run_id: str, config: AgentConfig) -> AgentState:
     if not isinstance(messages, list):
         raise ValueError(f"Run state messages are invalid: {path}")
 
+    plan = [str(step) for step in cast(list[Any], raw_state.get("plan", []))]
+    current_step = cast(str | None, raw_state.get("current_step"))
+    iteration_count = int(raw_state.get("iteration_count", 0))
+    command_count = int(raw_state.get("command_count", 0))
+
+    raw_plan_steps = raw_state.get("plan_steps")
+    plan_steps = (
+        cast(list[dict[str, Any]], raw_plan_steps)
+        if isinstance(raw_plan_steps, list)
+        else _default_plan_steps(plan, current_step)
+    )
+    budget_status = _normalize_budget_status(
+        raw_state.get("budget_status"),
+        iteration_count=iteration_count,
+        command_count=command_count,
+    )
+
     return AgentState(
         run_id=str(raw_state["run_id"]),
         user_goal=str(raw_state["user_goal"]),
         workspace_root=str(raw_state["workspace_root"]),
+        started_at=cast(str | None, raw_state.get("started_at")),
         messages=[_deserialize_message(cast(dict[str, Any], message)) for message in messages],
-        plan=[str(step) for step in cast(list[Any], raw_state.get("plan", []))],
-        current_step=cast(str | None, raw_state.get("current_step")),
+        plan=plan,
+        command_count=command_count,
+        plan_version=int(raw_state.get("plan_version", 1 if plan else 0)),
+        plan_revision_count=int(raw_state.get("plan_revision_count", 0)),
+        plan_steps=plan_steps,
+        last_reflection=cast(dict[str, Any] | None, raw_state.get("last_reflection")),
+        recovery_state=cast(dict[str, Any] | None, raw_state.get("recovery_state")),
+        budget_status=budget_status,
+        budget_stop_reason=cast(str | None, raw_state.get("budget_stop_reason")),
+        current_step=current_step,
         proposed_tool_call=cast(dict[str, Any] | None, raw_state.get("proposed_tool_call")),
         observations=cast(list[dict[str, Any]], raw_state.get("observations", [])),
         risk_decision=cast(str | None, raw_state.get("risk_decision")),
@@ -92,7 +167,7 @@ def load_run_state(run_id: str, config: AgentConfig) -> AgentState:
         last_write=cast(dict[str, Any] | None, raw_state.get("last_write")),
         last_verification=cast(dict[str, Any] | None, raw_state.get("last_verification")),
         last_rollback=cast(dict[str, Any] | None, raw_state.get("last_rollback")),
-        iteration_count=int(raw_state.get("iteration_count", 0)),
+        iteration_count=iteration_count,
         consecutive_failures=int(raw_state.get("consecutive_failures", 0)),
         final_answer=cast(str | None, raw_state.get("final_answer")),
     )

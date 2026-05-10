@@ -12,7 +12,7 @@ from typing import Annotated, Literal
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 
 class ToolCall(TypedDict):
@@ -95,6 +95,56 @@ class RollbackSummary(TypedDict):
     trigger: Literal["manual", "verify_failure"]
 
 
+PlanStepStatus = Literal["pending", "in_progress", "completed", "blocked", "skipped"]
+ReflectionOutcome = Literal["continue", "replan", "retry", "pause", "stop"]
+BudgetStopReason = Literal[
+    "max_iterations",
+    "max_command_count",
+    "max_runtime_seconds",
+    "max_plan_revisions",
+    "max_recovery_attempts",
+]
+
+
+class PlanStep(TypedDict):
+    """Structured plan step used by the phase-4 planning lifecycle."""
+
+    id: str
+    title: str
+    status: PlanStepStatus
+    rationale: str | None
+    evidence_refs: list[int]
+
+
+class ReflectionResult(TypedDict):
+    """Structured reflector output for scoring and next-action guidance."""
+
+    score: int
+    outcome: ReflectionOutcome
+    reason: str
+    retryable: bool
+    recommended_next_action: str | None
+
+
+class RecoveryState(TypedDict):
+    """Bounded recovery metadata for repeated failures."""
+
+    issue_type: str
+    fingerprint: str
+    attempt_count: int
+    last_action: str | None
+    can_retry: bool
+
+
+class BudgetStatus(TypedDict):
+    """Mutable budget counters tracked across a single run."""
+
+    iteration_count: int
+    command_count: int
+    elapsed_seconds: int
+    warning_triggered: bool
+
+
 class AgentState(TypedDict):
     """
     Full mutable state threaded through the LangGraph state machine.
@@ -112,11 +162,24 @@ class AgentState(TypedDict):
     # Absolute path to the sandboxed workspace directory
     workspace_root: str
 
+    # ISO-8601 timestamp for when the run was first created.
+    started_at: NotRequired[str | None]
+
     # Chat-style message history; add_messages appends rather than replaces
     messages: Annotated[list[BaseMessage], add_messages]
 
     # Ordered list of steps the Planner believes are needed to reach the goal
     plan: list[str]
+
+    # Phase-4 structured planning metadata; defaults keep stage 1-3 compatible.
+    command_count: NotRequired[int]
+    plan_version: NotRequired[int]
+    plan_revision_count: NotRequired[int]
+    plan_steps: NotRequired[list[PlanStep]]
+    last_reflection: NotRequired[ReflectionResult | None]
+    recovery_state: NotRequired[RecoveryState | None]
+    budget_status: NotRequired[BudgetStatus]
+    budget_stop_reason: NotRequired[BudgetStopReason | None]
 
     # Human-readable description of the step being executed right now
     current_step: str | None
