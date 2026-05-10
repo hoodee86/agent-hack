@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import re
 import time
 from typing import Any, Callable, cast
 
@@ -185,6 +186,12 @@ All paths and working directories must stay within the workspace root.
 - After any successful write, you MUST call run_command with a narrow validation command before giving a final answer.
 - If validation fails, inspect the failure output and either propose another narrow fix or explain the rollback path; never claim success.
 - After a command fails, inspect the referenced files or error locations before retrying.
+- Use the planner prompt's Last reflection and Recovery state sections to decide whether to continue,
+    replan, take one bounded recovery step, or stop.
+- If the last reflection says outcome=retry, take the recommended recovery action instead of repeating the
+    same failing command or path access.
+- If the last reflection says outcome=replan, update the plan before choosing the next tool call.
+- If the last reflection says outcome=stop, do not call another tool; provide a concise final answer.
 - Answer in plain text when you already have enough information.
 - Do not invent files, directories, file contents, command outputs, or test results.
 - Keep tool arguments minimal and precise.
@@ -201,6 +208,7 @@ _VALIDATION_COMMAND_KEYWORDS: tuple[str, ...] = (
     "compile",
 )
 _NON_VALIDATING_COMMAND_PREFIXES: tuple[str, ...] = ("git", "ls", "pwd", "find", "rg")
+_RECOVERY_LOCATION_RE = re.compile(r"([A-Za-z0-9_./-]+\.[A-Za-z0-9_]+)(?::(\d+))?")
 
 
 def _fmt_observations(observations: list[Observation], n: int = 5) -> str:
@@ -1357,6 +1365,350 @@ def _build_budget_stop_answer(
     return "\n".join(lines)
 
 
+def _fingerprint_text(value: Any, *, limit: int = 120) -> str:
+    text = " ".join(str(value).split()).strip()
+    if not text:
+        return "unknown"
+    if len(text) > limit:
+        return text[:limit]
+    return text
+
+
+def _extract_issue_location(*texts: str | None) -> str | None:
+    for text in texts:
+        if not text:
+            continue
+        match = _RECOVERY_LOCATION_RE.search(text)
+        if match is None:
+            continue
+        path = match.group(1)
+        line = match.group(2)
+        return f"{path}:{line}" if line else path
+    return None
+
+
+def _observation_action_label(obs: Observation) -> str:
+    result = obs.get("result")
+    if obs["tool"] == "run_command" and isinstance(result, dict):
+        return f"run_command {result.get('command', '(unknown)')}"
+    if obs["tool"] == "read_file" and isinstance(result, dict):
+        return f"read_file {result.get('path', '(unknown)')}"
+    if obs["tool"] == "search_text" and isinstance(result, dict):
+        return f"search_text {result.get('query', '(unknown)')}"
+    if obs["tool"] == "list_dir" and isinstance(result, dict):
+        return f"list_dir {result.get('path', '(unknown)')}"
+    return obs["tool"]
+
+
+def _observation_produced_new_information(obs: Observation) -> bool:
+    result = obs.get("result")
+    if isinstance(result, dict):
+        if obs["tool"] == "read_file":
+            return bool(str(result.get("content", "")).strip())
+        if obs["tool"] == "search_text":
+            return int(result.get("total_matches", 0) or 0) > 0
+        if obs["tool"] == "list_dir":
+            entries = result.get("entries")
+            return isinstance(entries, list) and len(entries) > 0
+        if obs["tool"] == "run_command":
+            return any(
+                bool(str(result.get(key, "")).strip())
+                for key in ("stdout", "stderr")
+            ) or result.get("exit_code") is not None
+        if obs["tool"] in _WRITE_TOOL_NAMES:
+            changed_files = result.get("changed_files")
+            return isinstance(changed_files, list) and len(changed_files) > 0
+        return bool(result)
+    return bool(obs.get("error"))
+
+
+def _classify_recovery_issue(
+    state: AgentState,
+    obs: Observation,
+) -> dict[str, Any] | None:
+    result = obs.get("result")
+    if obs["tool"] == "run_command" and isinstance(result, dict):
+        command = str(result.get("command", "(unknown)"))
+        stdout_preview = _preview_text(result.get("stdout"), limit=220)
+        stderr_preview = _preview_text(result.get("stderr"), limit=220)
+        issue_location = _extract_issue_location(stderr_preview, stdout_preview)
+        if bool(result.get("timed_out", False)):
+            return {
+                "issue_type": "command_timeout",
+                "fingerprint": f"command_timeout::{command}::{issue_location or 'timeout'}",
+                "retryable": False,
+                "reason": f"Command '{command}' timed out before completing.",
+                "recommended_next_action": (
+                    "Report the timeout and recommend a narrower command or direct file inspection instead of retrying blindly."
+                ),
+                "last_action": _observation_action_label(obs),
+            }
+
+        pending_verification = state.get("pending_verification")
+        if (
+            pending_verification is not None
+            and not obs["ok"]
+            and _is_validation_command(result)
+        ):
+            changed = ",".join(pending_verification["changed_files"][:3]) or "unknown"
+            return {
+                "issue_type": "verification_failed",
+                "fingerprint": (
+                    f"verification_failed::{command}::{changed}::"
+                    f"{issue_location or _fingerprint_text(result.get('error') or stderr_preview or stdout_preview)}"
+                ),
+                "retryable": True,
+                "reason": (
+                    f"Validation command '{command}' failed after a write and needs a narrower follow-up fix."
+                ),
+                "recommended_next_action": (
+                    "Inspect the validation output and referenced files before proposing another narrow change."
+                ),
+                "last_action": _observation_action_label(obs),
+            }
+
+        if not obs["ok"]:
+            return {
+                "issue_type": "command_failure",
+                "fingerprint": (
+                    f"command_failure::{command}::"
+                    f"{issue_location or _fingerprint_text(result.get('error') or stderr_preview or stdout_preview)}"
+                ),
+                "retryable": True,
+                "reason": f"Command '{command}' failed and requires nearby context before retrying.",
+                "recommended_next_action": _command_follow_up_hint(result),
+                "last_action": _observation_action_label(obs),
+            }
+
+        return None
+
+    if obs["tool"] == "search_text" and isinstance(result, dict):
+        if obs["ok"] and int(result.get("total_matches", 0) or 0) == 0:
+            query = str(result.get("query", "")).strip() or "(unknown)"
+            return {
+                "issue_type": "search_no_results",
+                "fingerprint": f"search_no_results::{query}",
+                "retryable": True,
+                "reason": f"Search returned no matches for '{query}'.",
+                "recommended_next_action": (
+                    "Try a narrower path or an alternate symbol or file name before repeating the same search."
+                ),
+                "last_action": _observation_action_label(obs),
+            }
+        return None
+
+    if obs["tool"] == "read_file" and isinstance(result, dict) and not obs["ok"]:
+        path = str(result.get("path", "(unknown)"))
+        error_text = str(result.get("error", obs.get("error") or ""))
+        issue_type = "file_missing" if "file not found" in error_text else "file_read_error"
+        return {
+            "issue_type": issue_type,
+            "fingerprint": f"{issue_type}::{path}::{_fingerprint_text(error_text)}",
+            "retryable": True,
+            "reason": f"Reading '{path}' failed: {error_text or 'unknown error'}.",
+            "recommended_next_action": (
+                "List the parent directory or search for similarly named files before retrying this read."
+            ),
+            "last_action": _observation_action_label(obs),
+        }
+
+    if obs["tool"] == "list_dir" and isinstance(result, dict) and not obs["ok"]:
+        path = str(result.get("path", "(unknown)"))
+        error_text = str(result.get("error", obs.get("error") or ""))
+        issue_type = "path_missing" if "not found" in error_text else "path_access_error"
+        return {
+            "issue_type": issue_type,
+            "fingerprint": f"{issue_type}::{path}::{_fingerprint_text(error_text)}",
+            "retryable": True,
+            "reason": f"Listing '{path}' failed: {error_text or 'unknown error'}.",
+            "recommended_next_action": (
+                "Inspect the parent directory or search for nearby paths before repeating the same listing request."
+            ),
+            "last_action": _observation_action_label(obs),
+        }
+
+    return None
+
+
+def _next_recovery_state(
+    config: AgentConfig,
+    state: AgentState,
+    issue: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if issue is None:
+        return None
+
+    previous = state.get("recovery_state")
+    previous_fingerprint = (
+        str(previous.get("fingerprint"))
+        if isinstance(previous, dict) and previous.get("fingerprint") is not None
+        else None
+    )
+    previous_attempt_count = (
+        int(previous.get("attempt_count", 0))
+        if isinstance(previous, dict)
+        else 0
+    )
+    attempt_count = previous_attempt_count + 1 if previous_fingerprint == issue["fingerprint"] else 1
+    can_retry = bool(issue.get("retryable", False)) and attempt_count <= config.max_recovery_attempts_per_issue
+    return {
+        "issue_type": str(issue["issue_type"]),
+        "fingerprint": str(issue["fingerprint"]),
+        "attempt_count": attempt_count,
+        "last_action": cast(str | None, issue.get("last_action")),
+        "can_retry": can_retry,
+    }
+
+
+def _budget_pressure(
+    config: AgentConfig,
+    budget_status: dict[str, Any],
+    *,
+    plan_revision_count: int,
+    recovery_attempt_count: int,
+) -> float:
+    ratios: list[float] = []
+    if config.max_iterations > 0:
+        ratios.append(float(budget_status["iteration_count"]) / float(config.max_iterations))
+    if config.max_command_count > 0:
+        ratios.append(float(budget_status["command_count"]) / float(config.max_command_count))
+    if config.max_runtime_seconds > 0:
+        ratios.append(float(budget_status["elapsed_seconds"]) / float(config.max_runtime_seconds))
+    if config.max_plan_revisions > 0:
+        ratios.append(float(plan_revision_count) / float(config.max_plan_revisions))
+    if config.max_recovery_attempts_per_issue > 0:
+        ratios.append(
+            float(max(0, recovery_attempt_count - 1))
+            / float(config.max_recovery_attempts_per_issue)
+        )
+    return max(ratios, default=0.0)
+
+
+def _build_reflection_result(
+    config: AgentConfig,
+    state: AgentState,
+    obs: Observation,
+    *,
+    issue: dict[str, Any] | None,
+    recovery_state: dict[str, Any] | None,
+    budget_status: dict[str, Any],
+    plan_revision_count: int,
+) -> dict[str, Any]:
+    new_information = _observation_produced_new_information(obs)
+    recovery_attempt_count = (
+        int(recovery_state.get("attempt_count", 0)) if isinstance(recovery_state, dict) else 0
+    )
+    budget_pressure = _budget_pressure(
+        config,
+        budget_status,
+        plan_revision_count=plan_revision_count,
+        recovery_attempt_count=recovery_attempt_count,
+    )
+    score = 100
+    if not new_information:
+        score -= 12
+    if not obs["ok"]:
+        score -= 30
+    if issue is not None:
+        issue_type = str(issue["issue_type"])
+        if issue_type == "command_timeout":
+            score -= 30
+        elif issue_type == "verification_failed":
+            score -= 22
+        elif issue_type in {"search_no_results", "file_missing", "path_missing"}:
+            score -= 18
+        else:
+            score -= 15
+    if recovery_attempt_count > 1:
+        score -= 15 * (recovery_attempt_count - 1)
+    score -= min(plan_revision_count, config.max_plan_revisions) * 5
+    score -= int(min(1.0, budget_pressure) * 35)
+    score = max(0, min(100, score))
+
+    recommended_next_action: str | None
+    reason: str
+    retryable = bool(issue.get("retryable", False)) if issue is not None else False
+    if issue is None:
+        reason = (
+            "Latest observation produced new information and does not require bounded recovery."
+            if new_information
+            else "Latest observation added little information; continue cautiously."
+        )
+        recommended_next_action = (
+            "Proceed to the next planned step using the newest observation as evidence."
+        )
+        if score <= config.reflection_stop_threshold:
+            outcome = "stop"
+            recommended_next_action = "Summarize the current evidence instead of continuing."
+        elif score <= config.reflection_replan_threshold:
+            outcome = "replan"
+            recommended_next_action = "Revise the next step before calling another tool."
+        else:
+            outcome = "continue"
+    else:
+        issue_type = str(issue["issue_type"])
+        reason = str(issue["reason"])
+        recommended_next_action = cast(str | None, issue.get("recommended_next_action"))
+        if issue_type == "command_timeout":
+            outcome = "stop"
+            retryable = False
+        elif isinstance(recovery_state, dict) and not bool(recovery_state.get("can_retry", False)):
+            outcome = "stop"
+            retryable = False
+            if recommended_next_action is None:
+                recommended_next_action = (
+                    "Stop automatic recovery and summarize the current state for manual follow-up."
+                )
+        elif issue_type in {"search_no_results", "file_missing", "path_missing", "verification_failed"}:
+            outcome = "replan"
+        elif issue_type == "command_failure" and isinstance(recovery_state, dict):
+            if int(recovery_state.get("attempt_count", 0)) <= 1:
+                outcome = "retry"
+            else:
+                outcome = "replan"
+        elif isinstance(recovery_state, dict) and int(recovery_state.get("attempt_count", 0)) > 1:
+            outcome = "replan"
+        elif score <= config.reflection_replan_threshold:
+            outcome = "replan"
+        else:
+            outcome = "retry"
+
+    return {
+        "score": score,
+        "outcome": outcome,
+        "reason": reason,
+        "retryable": retryable,
+        "recommended_next_action": recommended_next_action,
+    }
+
+
+def _build_reflection_stop_answer(
+    reflection: dict[str, Any],
+    state: AgentState,
+    recovery_state: dict[str, Any] | None,
+) -> str:
+    lines = [
+        "Agent stopped after reflector judged that continuing would have low value.",
+        f"Reflection score: {reflection.get('score', '(unknown)')}",
+        f"Outcome: {reflection.get('outcome', '(unknown)')}",
+        f"Reason: {reflection.get('reason', '(none)')}",
+    ]
+    next_action = reflection.get("recommended_next_action")
+    if next_action:
+        lines.append(f"Recommended next action: {next_action}")
+    if isinstance(recovery_state, dict):
+        lines.append(
+            "Recovery state: "
+            f"{recovery_state.get('issue_type', '(unknown)')} | "
+            f"fingerprint={recovery_state.get('fingerprint', '(unknown)')} | "
+            f"attempts={recovery_state.get('attempt_count', 0)}"
+        )
+    if state["observations"]:
+        lines.append("Last observations:")
+        lines.append(_fmt_observations(state["observations"], n=3))
+    return "\n".join(lines)
+
+
 def _is_deepseek_model(model_name: str) -> bool:
     return model_name.strip().lower().startswith("deepseek")
 
@@ -1552,6 +1904,19 @@ def _make_planner(
                 event_listener,
             )
 
+        updated_recovery_state = state.get("recovery_state")
+        if (
+            isinstance(updated_recovery_state, dict)
+            and next_step is not None
+            and budget_stop_reason is None
+        ):
+            last_reflection = state.get("last_reflection")
+            if isinstance(last_reflection, dict) and str(last_reflection.get("outcome")) in {"retry", "replan"}:
+                updated_recovery_state = {
+                    **updated_recovery_state,
+                    "last_action": next_step,
+                }
+
         # ── Audit ────────────────────────────────────────────────────────
         _one_shot_audit(
             run_id,
@@ -1574,7 +1939,7 @@ def _make_planner(
                     recovery_attempt_count=recovery_attempt_count,
                 ),
                 "last_reflection": state.get("last_reflection"),
-                "recovery_state": state.get("recovery_state"),
+                "recovery_state": updated_recovery_state,
             },
             event_listener,
         )
@@ -1598,6 +1963,7 @@ def _make_planner(
             "command_count": command_count,
             "budget_status": budget_status,
             "budget_stop_reason": budget_stop_reason,
+            "recovery_state": updated_recovery_state,
             "proposed_tool_call": None if budget_stop_reason is not None else tool_call,
             "final_answer": final_answer,
         }
@@ -1965,6 +2331,11 @@ def _make_reflector(
         budget_status = _budget_status_snapshot(state)
         plan_revision_count = _effective_plan_revision_count(state)
         recovery_attempt_count = _current_recovery_attempt_count(state)
+        reflection_result: dict[str, Any] | None = None
+        next_recovery_state: dict[str, Any] | None = cast(
+            dict[str, Any] | None,
+            state.get("recovery_state"),
+        )
 
         # Circuit-breaker: total iteration limit
         if state["iteration_count"] >= config.max_iterations:
@@ -2062,6 +2433,85 @@ def _make_reflector(
             }
 
         if last_obs is not None:
+            issue = _classify_recovery_issue(state, last_obs)
+            next_recovery_state = _next_recovery_state(config, state, issue)
+            reflection_result = _build_reflection_result(
+                config,
+                state,
+                last_obs,
+                issue=issue,
+                recovery_state=next_recovery_state,
+                budget_status=budget_status,
+                plan_revision_count=plan_revision_count,
+            )
+            next_recovery_attempt_count = (
+                int(next_recovery_state.get("attempt_count", 0))
+                if isinstance(next_recovery_state, dict)
+                else 0
+            )
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_REFLECTOR_ACTION,
+                {
+                    "reason": "reflection_scored",
+                    "score": reflection_result["score"],
+                    "outcome": reflection_result["outcome"],
+                    "retryable": reflection_result["retryable"],
+                    "reflection_reason": reflection_result["reason"],
+                    "recommended_next_action": reflection_result["recommended_next_action"],
+                    "tool": last_obs["tool"],
+                    "issue_type": None if issue is None else issue["issue_type"],
+                    "recovery_attempt_count": next_recovery_attempt_count,
+                    "budget_status": budget_status,
+                    "budget_pressure": _budget_pressure(
+                        config,
+                        budget_status,
+                        plan_revision_count=plan_revision_count,
+                        recovery_attempt_count=next_recovery_attempt_count,
+                    ),
+                    "new_information": _observation_produced_new_information(last_obs),
+                },
+                event_listener,
+            )
+            if isinstance(next_recovery_state, dict):
+                _one_shot_audit(
+                    run_id,
+                    config.log_dir,
+                    EVENT_REFLECTOR_ACTION,
+                    {
+                        "reason": "recovery_attempted",
+                        **next_recovery_state,
+                        "recommended_next_action": reflection_result["recommended_next_action"],
+                    },
+                    event_listener,
+                )
+                if not bool(next_recovery_state.get("can_retry", False)):
+                    _one_shot_audit(
+                        run_id,
+                        config.log_dir,
+                        EVENT_REFLECTOR_ACTION,
+                        {
+                            "reason": "recovery_exhausted",
+                            **next_recovery_state,
+                            "recommended_next_action": reflection_result["recommended_next_action"],
+                        },
+                        event_listener,
+                    )
+            elif isinstance(state.get("recovery_state"), dict):
+                previous_recovery_state = cast(dict[str, Any], state["recovery_state"])
+                _one_shot_audit(
+                    run_id,
+                    config.log_dir,
+                    EVENT_REFLECTOR_ACTION,
+                    {
+                        "reason": "recovery_cleared",
+                        "issue_type": previous_recovery_state.get("issue_type"),
+                        "fingerprint": previous_recovery_state.get("fingerprint"),
+                    },
+                    event_listener,
+                )
+
             command_reflection = _command_reflection_payload(last_obs)
             if command_reflection is not None:
                 _one_shot_audit(
@@ -2077,7 +2527,11 @@ def _make_reflector(
                     and isinstance(result, dict)
                     and result.get("timed_out")
                 ):
-                    return {"final_answer": _build_command_timeout_answer(last_obs)}
+                    return {
+                        "last_reflection": reflection_result,
+                        "recovery_state": next_recovery_state,
+                        "final_answer": _build_command_timeout_answer(last_obs),
+                    }
 
         pending_verification = state.get("pending_verification")
         if last_obs is not None and pending_verification is not None:
@@ -2119,6 +2573,8 @@ def _make_reflector(
                             "pending_verification": None,
                             "last_verification": verification,
                             "last_rollback": None,
+                            "last_reflection": reflection_result,
+                            "recovery_state": next_recovery_state,
                         }
 
                     rollback_summary: RollbackSummary | None = None
@@ -2165,6 +2621,8 @@ def _make_reflector(
                         "pending_verification": None,
                         "last_verification": verification,
                         "last_rollback": rollback_summary,
+                        "last_reflection": reflection_result,
+                        "recovery_state": next_recovery_state,
                     }
                     if rollback_summary is not None:
                         state_update["final_answer"] = _build_validation_failure_answer(
@@ -2189,6 +2647,33 @@ def _make_reflector(
                     event_listener,
                 )
 
+        if reflection_result is not None and reflection_result["outcome"] == "stop":
+            state_update: dict[str, Any] = {
+                "last_reflection": reflection_result,
+                "recovery_state": next_recovery_state,
+            }
+            if isinstance(next_recovery_state, dict) and not bool(next_recovery_state.get("can_retry", False)):
+                state_update.update(
+                    {
+                        "budget_stop_reason": "max_recovery_attempts",
+                        "final_answer": _build_budget_stop_answer(
+                            "max_recovery_attempts",
+                            state,
+                            config,
+                            budget_status,
+                            plan_revision_count=plan_revision_count,
+                            recovery_attempt_count=int(next_recovery_state.get("attempt_count", 0)),
+                        ),
+                    }
+                )
+            else:
+                state_update["final_answer"] = _build_reflection_stop_answer(
+                    reflection_result,
+                    state,
+                    next_recovery_state,
+                )
+            return state_update
+
         # Circuit-breaker: consecutive failure limit
         if state["consecutive_failures"] >= config.max_consecutive_failures:
             last_err = (
@@ -2208,6 +2693,8 @@ def _make_reflector(
                 event_listener,
             )
             return {
+                "last_reflection": reflection_result,
+                "recovery_state": next_recovery_state,
                 "final_answer": (
                     f"Agent stopped: {state['consecutive_failures']} consecutive "
                     f"tool failures.\nLast error: {last_err}"
@@ -2215,7 +2702,10 @@ def _make_reflector(
             }
 
         # All good – continue the loop
-        return {}
+        return {
+            "last_reflection": reflection_result,
+            "recovery_state": next_recovery_state,
+        }
 
     return reflector
 
@@ -2235,6 +2725,8 @@ def _make_finalizer(
         last_verification = state.get("last_verification")
         last_rollback = state.get("last_rollback")
         pending_verification = state.get("pending_verification")
+        last_reflection = cast(dict[str, Any] | None, state.get("last_reflection"))
+        recovery_state = cast(dict[str, Any] | None, state.get("recovery_state"))
         plan_steps = _effective_plan_steps(state)
         plan_revision_count = _effective_plan_revision_count(state)
         recovery_attempt_count = _current_recovery_attempt_count(state)
@@ -2301,9 +2793,36 @@ def _make_finalizer(
             if state.get("current_step") is not None:
                 budget_lines.append(f"Current step: {state['current_step']}")
             final = f"{final}\n\nBudget usage:\n" + "\n".join(budget_lines)
+        if (
+            last_reflection is not None
+            and last_reflection.get("outcome") != "continue"
+            and "Last reflection:" not in final
+        ):
+            reflection_lines = [
+                f"Score: {last_reflection['score']}",
+                f"Outcome: {last_reflection['outcome']}",
+                f"Reason: {last_reflection['reason']}",
+            ]
+            if last_reflection.get("recommended_next_action"):
+                reflection_lines.append(
+                    f"Recommended next action: {last_reflection['recommended_next_action']}"
+                )
+            final = f"{final}\n\nLast reflection:\n" + "\n".join(reflection_lines)
+        if recovery_state is not None and "Recovery state:" not in final:
+            recovery_lines = [
+                f"Issue type: {recovery_state['issue_type']}",
+                f"Fingerprint: {recovery_state['fingerprint']}",
+                f"Attempt count: {recovery_state['attempt_count']}",
+                f"Can retry: {recovery_state['can_retry']}",
+            ]
+            if recovery_state.get("last_action"):
+                recovery_lines.append(f"Last action: {recovery_state['last_action']}")
+            final = f"{final}\n\nRecovery state:\n" + "\n".join(recovery_lines)
 
         if budget_stop_reason is not None:
             status = "budget_exhausted"
+        elif last_reflection is not None and last_reflection.get("outcome") == "stop":
+            status = "stopped_after_reflection"
         elif state.get("risk_decision") == "needs_approval":
             status = "paused_for_approval"
         elif final.startswith("User rejected approval request"):
@@ -2340,6 +2859,8 @@ def _make_finalizer(
                 "budget_status": budget_status,
                 "budget_remaining": budget_remaining,
                 "budget_stop_reason": budget_stop_reason,
+                "last_reflection": last_reflection,
+                "recovery_state": recovery_state,
                 "verification_status": (
                     None
                     if last_verification is None

@@ -13,7 +13,8 @@
 - T18-T35 已完成。
 - T36 已完成。
 - T37 已完成。
-- T38-T39 未开始。
+- T38 已完成。
+- T39 已完成。
 - T40 已完成。
 - T41-T44 未开始。
 
@@ -194,7 +195,7 @@ class BudgetStatus(TypedDict):
 - `plan_update` 审计事件已扩展为包含 `plan_steps`、`plan_version`、`plan_revision_count`、`plan_revision_reason`，CLI verbose 也会显示这些字段。
 - 已新增回归测试覆盖失败后计划修订和计划版本审计落盘。
 
-### T38 — Reflector 反思评分与结构化决策
+### T38 — Reflector 反思评分与结构化决策 已完成
 
 **文件**：`src/linux_agent/graph.py`，必要时新增 `src/linux_agent/reflection.py`
 
@@ -229,7 +230,14 @@ class BudgetStatus(TypedDict):
 - 低分或高风险情况下，graph 会优先停止或重规划，而不是继续盲跑。
 - 反思评分结果可进入 audit 和最终总结。
 
-### T39 — 连续错误恢复状态机
+**实现结果（2026-05-10）**：
+
+- Reflector 已新增确定性结构化反思结果，填充 `last_reflection.score / outcome / reason / retryable / recommended_next_action`。
+- 评分已综合最近 observation 是否产生新信息、失败类型、预算压力、计划修订次数和当前恢复尝试次数。
+- `reflector_action` 审计事件已新增 `reason=reflection_scored` 载荷，并在 `run_end` 中落入 `last_reflection`；最终回答也会在非 `continue` 场景追加反思摘要。
+- 当前已实际使用的 outcome 包括 `continue`、`retry`、`replan`、`stop`；`pause` 仍保留在数据模型中，待后续审批交互增强阶段进一步接入。
+
+### T39 — 连续错误恢复状态机 已完成
 
 **文件**：`src/linux_agent/graph.py`，必要时新增 `src/linux_agent/recovery.py`
 
@@ -258,6 +266,13 @@ class BudgetStatus(TypedDict):
 - Agent 可以在简单连续错误场景下进行 1-2 轮有意义的恢复，而不是立即失败或无限重试。
 - 相同错误不会无限重复尝试。
 - 恢复计数和恢复原因会被审计记录。
+
+**实现结果（2026-05-10）**：
+
+- graph 已实现失败分类与恢复指纹，当前覆盖 `command_failure`、`command_timeout`、`search_no_results`、`file_missing` / `file_read_error`、`path_missing` / `path_access_error`、`verification_failed`。
+- `recovery_state` 现在会跟踪 `issue_type`、`fingerprint`、`attempt_count`、`last_action`、`can_retry`，并在恢复成功后自动清空。
+- 对同一恢复指纹的重复失败会递增尝试次数；超过 `max_recovery_attempts_per_issue` 后，Reflector 会停止自动恢复并通过 `budget_stop_reason=max_recovery_attempts` 结束运行。
+- `reflector_action` 审计事件已新增 `recovery_attempted`、`recovery_exhausted`、`recovery_cleared` 语义载荷；已新增回归测试覆盖首次恢复、恢复成功清空状态和重复失败熔断。
 
 ### T40 — 任务预算执行与硬熔断 已完成
 

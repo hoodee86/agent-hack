@@ -561,6 +561,10 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             if data.get("plan_steps") is not None:
                 _print_field(stream, "Plan Steps", data.get("plan_steps"), use_color=use_color)
             _print_budget_fields(data)
+            if data.get("last_reflection") is not None:
+                _print_field(stream, "Last Reflection", data.get("last_reflection"), use_color=use_color)
+            if data.get("recovery_state") is not None:
+                _print_field(stream, "Recovery State", data.get("recovery_state"), use_color=use_color)
             if data.get("verification_status") is not None:
                 _print_field(stream, "Verification", data.get("verification_status"), use_color=use_color, inline=True)
             if data.get("verification_command") is not None:
