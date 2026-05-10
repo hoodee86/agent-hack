@@ -532,10 +532,15 @@ def build_graph(
         print(result["final_answer"])
     """
     if chat_model is None:
-        chat_model = ChatOpenAI(
-            model=config.llm_model,
-            temperature=config.llm_temperature,
-        )
+        llm_kwargs: dict[str, Any] = {
+            "model": config.llm_model,
+            "temperature": config.llm_temperature,
+        }
+        if config.llm_base_url is not None:
+            llm_kwargs["base_url"] = config.llm_base_url
+        if config.llm_api_key is not None:
+            llm_kwargs["api_key"] = config.llm_api_key
+        chat_model = ChatOpenAI(**llm_kwargs)
 
     graph: Any = StateGraph(AgentState)
 

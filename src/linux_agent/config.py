@@ -39,6 +39,10 @@ class AgentConfig(BaseModel):
     # --- LLM -------------------------------------------------------------
     llm_model: str = "gpt-4o"
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    # OpenAI-compatible base URL, e.g. https://api.deepseek.com/v1
+    llm_base_url: str | None = None
+    # API key for the configured provider; prefer env vars in practice
+    llm_api_key: str | None = None
 
     # --- Security --------------------------------------------------------
     # Path components (str) that are never allowed, regardless of workspace
@@ -66,6 +70,15 @@ class AgentConfig(BaseModel):
     @classmethod
     def _expand_log_dir(cls, v: Any) -> Path:
         return Path(v).expanduser()
+
+    @field_validator("llm_base_url", "llm_api_key", mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return str(v)
 
     @model_validator(mode="after")
     def _validate_workspace_exists(self) -> "AgentConfig":
@@ -108,6 +121,12 @@ def load_config(path: str | None = None) -> AgentConfig:
             loaded = yaml.safe_load(fh)
             if isinstance(loaded, dict):
                 data = loaded
+        for key in ("workspace_root", "log_dir"):
+            value = data.get(key)
+            if isinstance(value, str):
+                candidate = Path(value).expanduser()
+                if not candidate.is_absolute():
+                    data[key] = str((config_path.parent / candidate).resolve())
 
     # Fall back to environment variable for workspace_root when not in YAML
     if "workspace_root" not in data:
@@ -119,6 +138,24 @@ def load_config(path: str | None = None) -> AgentConfig:
                 "workspace_root must be set via config file or "
                 "LINUX_AGENT_WORKSPACE environment variable"
             )
+
+    if "llm_base_url" not in data:
+        env_base_url = (
+            os.environ.get("LINUX_AGENT_LLM_BASE_URL")
+            or os.environ.get("DEEPSEEK_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+        )
+        if env_base_url:
+            data["llm_base_url"] = env_base_url
+
+    if "llm_api_key" not in data:
+        env_api_key = (
+            os.environ.get("LINUX_AGENT_LLM_API_KEY")
+            or os.environ.get("DEEPSEEK_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+        if env_api_key:
+            data["llm_api_key"] = env_api_key
 
     return AgentConfig(**data)
 

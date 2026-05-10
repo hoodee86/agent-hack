@@ -1,8 +1,15 @@
-workspace_root: ./workspace
+workspace_root: .
 max_iterations: 12
 max_read_bytes: 65536
 max_search_results: 100
 max_list_entries: 200
-llm_model: gpt-4o
+llm_model: deepseek-v4-pro
 llm_temperature: 0.0
+llm_base_url: https://api.deepseek.com
+llm_api_key: sk-20f2abb78b2d44869fca04806267299f
 log_dir: logs
+
+# DeepSeek example:
+# llm_model: deepseek-chat
+# llm_base_url: https://api.deepseek.com/v1
+# Prefer exporting DEEPSEEK_API_KEY instead of storing the key here.
