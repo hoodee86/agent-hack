@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
+from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
@@ -17,6 +18,8 @@ from typing_extensions import TypedDict
 class ToolCall(TypedDict):
     """A single tool invocation proposed by the Planner node."""
 
+    # Provider-generated tool-call id so ToolMessage can be correlated
+    id: str
     # Tool name – one of: list_dir | read_file | search_text (phase 1)
     name: str
     # Raw arguments forwarded to the skill function unchanged
@@ -58,7 +61,7 @@ class AgentState(TypedDict):
     workspace_root: str
 
     # Chat-style message history; add_messages appends rather than replaces
-    messages: Annotated[list[dict[str, object]], add_messages]
+    messages: Annotated[list[BaseMessage], add_messages]
 
     # Ordered list of steps the Planner believes are needed to reach the goal
     plan: list[str]

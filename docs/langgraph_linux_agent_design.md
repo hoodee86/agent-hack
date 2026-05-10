@@ -12,6 +12,8 @@
 - 对高风险操作触发人工确认或策略拒绝。
 - 记录完整行动轨迹，便于调试、复盘和安全审计。
 
+> 当前仓库实现只覆盖第一阶段只读能力，默认使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`，并使用原生 tool calling 驱动 `list_dir` / `read_file` / `search_text`。文中关于写文件、命令执行和 `needs_approval` 的部分属于后续阶段设计，并未在当前代码中启用。
+
 ## 2. 范围与非目标
 
 ### 2.1 范围
@@ -107,13 +109,14 @@ class AgentState(TypedDict):
     run_id: str
     user_goal: str
     workspace_root: str
-    messages: list[dict]
+  messages: list[BaseMessage]
     plan: list[str]
     current_step: str | None
     proposed_tool_call: ToolCall | None
     observations: list[Observation]
-    risk_decision: Literal["allow", "deny", "needs_approval"] | None
+  risk_decision: Literal["allow", "deny"] | None
     iteration_count: int
+  consecutive_failures: int
     final_answer: str | None
 ```
 
@@ -129,14 +132,15 @@ class AgentState(TypedDict):
 
 ### 5.1 Planner 节点
 
-职责：理解用户目标，生成或更新计划，并提出下一次工具调用。
+职责：理解用户目标，生成或更新计划，并通过模型原生 tool calling 决定是否提出下一次工具调用。
 
 输入：`user_goal`、历史消息、当前计划、历史观察。
 
-输出：`plan`、`current_step`、`proposed_tool_call`。
+输出：`plan`、`current_step`、`proposed_tool_call` 或 `final_answer`。
 
 典型行为：
 
+- 通过 OpenAI 兼容的聊天模型绑定 `list_dir`、`read_file`、`search_text` 三个工具 schema。
 - 先用 `list_dir` 或 `search_text` 建立上下文。
 - 对不确定信息优先观察，而不是臆测。
 - 对复杂任务拆分为小步骤。
@@ -155,11 +159,10 @@ class AgentState(TypedDict):
 
 输出：`risk_decision`。
 
-决策规则：
+当前阶段决策规则：
 
-- `allow`：低风险读操作、普通构建/测试命令。
-- `needs_approval`：写文件、安装依赖、删除文件、修改权限、访问网络。
-- `deny`：提权、读取敏感文件、破坏性磁盘操作、隐藏进程、绕过审计。
+- `allow`：低风险只读工具调用。
+- `deny`：非只读工具、路径越界、命中敏感路径的请求。
 
 ### 5.3 Tool Executor 节点
 
@@ -167,11 +170,9 @@ class AgentState(TypedDict):
 
 执行要求：
 
-- 每个工具设置超时。
-- 捕获 stdout、stderr、exit code。
+- 根据 `proposed_tool_call["name"]` 分发到只读 skill。
+- 将工具结果写回 `Observation`，并同步追加 `ToolMessage` 供下一轮 Planner 继续对话。
 - 输出过长时截断并提示截断。
-- 文件写入要保留 diff 或备份策略。
-- 命令执行必须指定工作目录。
 
 ### 5.4 Reflector 节点
 
@@ -205,10 +206,7 @@ stateDiagram-v2
     Planner --> Finalizer: final_answer exists
     Planner --> PolicyGuard: proposed_tool_call exists
     PolicyGuard --> ToolExecutor: allow
-    PolicyGuard --> Approval: needs_approval
-    PolicyGuard --> Reflector: deny
-    Approval --> ToolExecutor: approved
-    Approval --> Reflector: rejected
+  PolicyGuard --> Finalizer: deny
     ToolExecutor --> Reflector
     Reflector --> Planner: continue
     Reflector --> Finalizer: stop condition
@@ -395,7 +393,7 @@ stateDiagram-v2
 日志可写入 JSONL：
 
 ```json
-{"run_id":"...","event":"tool_call","tool":"run_command","args":{"command":"pytest -q"}}
+{"run_id":"...","event":"tool_proposed","data":{"tool":"read_file","args":{"path":"README.md"}}}
 ```
 
 ## 9. 原型目录结构建议

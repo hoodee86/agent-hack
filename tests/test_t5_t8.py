@@ -14,7 +14,6 @@ import pytest
 from linux_agent.config import AgentConfig
 from linux_agent.policy import (
     PolicyViolation,
-    check_read_only_tool,
     evaluate_tool_call,
     resolve_safe_path,
 )
@@ -32,7 +31,12 @@ def make_config(tmp_path: Path, **kwargs: object) -> AgentConfig:
 
 
 def make_tool_call(name: str, args: dict | None = None) -> ToolCall:
-    return ToolCall(name=name, args=args or {}, risk_level="low")
+    return ToolCall(
+        id=f"{name}_test",
+        name=name,
+        args=args or {},
+        risk_level="low",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,28 +103,6 @@ class TestResolveSafePath:
     def test_nonexistent_traversal_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(PolicyViolation, match="escapes workspace root"):
             resolve_safe_path(tmp_path, "../../outside.txt")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# T5 – check_read_only_tool
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestCheckReadOnlyTool:
-    def test_allowed_tools(self) -> None:
-        for name in ("list_dir", "read_file", "search_text"):
-            check_read_only_tool(name)  # must not raise
-
-    def test_write_file_rejected(self) -> None:
-        with pytest.raises(PolicyViolation):
-            check_read_only_tool("write_file")
-
-    def test_run_command_rejected(self) -> None:
-        with pytest.raises(PolicyViolation):
-            check_read_only_tool("run_command")
-
-    def test_unknown_tool_rejected(self) -> None:
-        with pytest.raises(PolicyViolation):
-            check_read_only_tool("apply_patch")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

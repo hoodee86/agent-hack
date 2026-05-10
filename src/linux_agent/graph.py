@@ -24,15 +24,20 @@ Graph topology
 from __future__ import annotations
 
 import json
-import re
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
 
 from linux_agent.audit import (
     EVENT_PLAN_UPDATE,
@@ -51,39 +56,37 @@ from linux_agent.state import AgentState, Observation, ToolCall
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# T9 – Planner output schema
+# Tool schemas exposed to the model
 # ─────────────────────────────────────────────────────────────────────────────
 
-class PlannerDecision(BaseModel):
-    """Structured output produced by the Planner LLM call."""
+@tool("list_dir")
+def list_dir_tool(path: str, recursive: bool = False) -> str:
+    """List entries under a workspace-relative directory path. Use '.' for the workspace root."""
+    raise RuntimeError("list_dir is executed by linux_agent.graph, not by LangChain.")
 
-    thought: str = Field(
-        description="Step-by-step reasoning about the current state and what to do next."
-    )
-    plan: list[str] = Field(
-        description="Updated ordered list of steps to accomplish the goal."
-    )
-    current_step: str = Field(
-        description="Human-readable description of the current action being taken."
-    )
-    tool_name: str | None = Field(
-        default=None,
-        description=(
-            "Tool to invoke: 'list_dir' | 'read_file' | 'search_text'. "
-            "Set to null only when final_answer is also set."
-        ),
-    )
-    tool_args: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Keyword arguments forwarded to the tool. Empty when tool_name is null.",
-    )
-    final_answer: str | None = Field(
-        default=None,
-        description=(
-            "The complete answer to the user's goal. Set when finished or unable to progress. "
-            "Null while still working."
-        ),
-    )
+
+@tool("read_file")
+def read_file_tool(
+    path: str,
+    start_line: int = 1,
+    end_line: int | None = None,
+) -> str:
+    """Read a workspace-relative text file. Provide start_line/end_line only when you need a slice."""
+    raise RuntimeError("read_file is executed by linux_agent.graph, not by LangChain.")
+
+
+@tool("search_text")
+def search_text_tool(
+    query: str,
+    path: str = ".",
+    glob: str = "**/*",
+    context_lines: int = 2,
+) -> str:
+    """Search for a literal string inside workspace files. Use glob to narrow the search when helpful."""
+    raise RuntimeError("search_text is executed by linux_agent.graph, not by LangChain.")
+
+
+_MODEL_TOOLS = [list_dir_tool, read_file_tool, search_text_tool]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,34 +110,11 @@ All paths must be relative to the workspace root. Use "." for the root itself.
 
 ## Rules
 
-- Keep `final_answer` null and provide a `tool_name` while you are still gathering information.
-- Set `final_answer` (non-null) when:
-  1. You have enough information to fully answer the goal, OR
-  2. You cannot make further progress — explain why.
-- Never set both `tool_name` and `final_answer` at the same time.
-"""
-
-# Extra suffix appended to the system prompt in "prompt" mode (no tool_choice support)
-_JSON_SCHEMA_PROMPT = """
-## Output format
-
-You MUST reply with a single JSON object (no prose, no markdown fences) matching:
-
-{
-  "thought": "<your reasoning>",
-  "plan": ["step 1", "step 2", ...],
-  "current_step": "<what you are doing right now>",
-  "tool_name": "list_dir" | "read_file" | "search_text" | null,
-  "tool_args": { ... } | {},
-  "final_answer": "<complete answer>" | null
-}
-
-Rules for tool_args:
-- list_dir:    {"path": "<rel-path>", "recursive": true|false}
-- read_file:   {"path": "<rel-path>", "start_line": <int>, "end_line": <int>}
-- search_text: {"query": "<text>", "path": "<rel-path>", "glob": "**/*"}
-
-Output ONLY the JSON object. No explanation before or after it.
+- Use tool calling directly when you need more evidence.
+- Call at most one tool at a time.
+- Answer in plain text when you already have enough information.
+- Do not invent files, directories, or file contents.
+- Keep tool arguments minimal and precise.
 """
 
 
@@ -170,31 +150,127 @@ def _one_shot_audit(
         logger.log(event, data)
 
 
-def _extract_json(text: str) -> dict[str, Any]:
-    """Extract the first JSON object from a model response.
+def _serialize_tool_payload(obs: Observation, limit: int = 4000) -> str:
+    payload: dict[str, Any] = {
+        "tool": obs["tool"],
+        "ok": obs["ok"],
+        "result": obs["result"],
+        "error": obs["error"],
+        "duration_ms": obs["duration_ms"],
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) > limit:
+        return text[:limit] + " …"
+    return text
 
-    Handles three common formats:
-    1. ```json\n{...}\n```
-    2. ```\n{...}\n```
-    3. Raw {…} anywhere in the text
-    """
-    # Strip fenced code block
-    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fenced:
-        return json.loads(fenced.group(1).strip())  # type: ignore[no-any-return]
-    # Find first { ... } block
-    brace_start = text.find("{")
-    if brace_start != -1:
-        # Walk to find the matching closing brace
-        depth = 0
-        for i, ch in enumerate(text[brace_start:], start=brace_start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return json.loads(text[brace_start : i + 1])  # type: ignore[no-any-return]
-    raise ValueError(f"No JSON object found in model response:\n{text[:300]}")
+
+def _format_planner_prompt(state: AgentState, config: AgentConfig) -> str:
+    plan_text = (
+        "\n".join(f"  {i + 1}. {step}" for i, step in enumerate(state["plan"]))
+        or "  (not yet planned)"
+    )
+    obs_text = _fmt_observations(state["observations"])
+    return (
+        f"Goal: {state['user_goal']}\n\n"
+        f"Workspace root: {state['workspace_root']}\n\n"
+        f"Current plan:\n{plan_text}\n\n"
+        f"Recent observations:\n{obs_text}\n\n"
+        f"Iterations used: {state['iteration_count']} / {config.max_iterations}\n"
+        f"Consecutive failures: {state['consecutive_failures']} / "
+        f"{config.max_consecutive_failures}"
+    )
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                if part.strip():
+                    parts.append(part.strip())
+                continue
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
+def _bind_model_tools(llm: BaseChatModel) -> Any:
+    try:
+        return llm.bind_tools(_MODEL_TOOLS, parallel_tool_calls=False)
+    except TypeError:
+        return llm.bind_tools(_MODEL_TOOLS)
+
+
+def _coerce_ai_message(response: Any) -> AIMessage:
+    if isinstance(response, AIMessage):
+        return response
+
+    content = getattr(response, "content", response)
+    tool_calls = getattr(response, "tool_calls", None) or []
+    return AIMessage(content=content, tool_calls=tool_calls)
+
+
+def _coerce_tool_args(raw_args: Any) -> dict[str, object]:
+    if isinstance(raw_args, dict):
+        return {str(key): cast(object, value) for key, value in raw_args.items()}
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return {str(key): cast(object, value) for key, value in parsed.items()}
+    return {}
+
+
+def _build_tool_call(message: AIMessage, state: AgentState) -> ToolCall | None:
+    tool_calls = message.tool_calls or []
+    if not tool_calls:
+        return None
+
+    raw_call = tool_calls[0]
+    raw_name = raw_call.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return None
+
+    raw_id = raw_call.get("id")
+    call_id = str(raw_id) if raw_id else f"{raw_name}_{state['iteration_count'] + 1}"
+    return ToolCall(
+        id=call_id,
+        name=raw_name,
+        args=_coerce_tool_args(raw_call.get("args", {})),
+        risk_level="low",
+    )
+
+
+def _tool_step(tool_call: ToolCall) -> str:
+    args_json = json.dumps(tool_call["args"], ensure_ascii=False)
+    return f"Calling {tool_call['name']} {args_json}"
+
+
+def _summarize_step(message: AIMessage, tool_call: ToolCall | None) -> str:
+    content = _content_to_text(message.content)
+    if content:
+        first_line = content.splitlines()[0].strip()
+        if first_line:
+            return first_line[:240]
+    if tool_call is not None:
+        return _tool_step(tool_call)
+    return "Preparing final answer"
+
+
+def _append_plan_step(plan: list[str], step: str) -> list[str]:
+    normalized = step.strip()
+    if not normalized:
+        return plan
+    if plan and plan[-1] == normalized:
+        return plan
+    return [*plan, normalized]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,128 +281,31 @@ def _make_planner(
     config: AgentConfig,
     llm: BaseChatModel,
 ) -> Callable[[AgentState], dict[str, Any]]:
-    """Return a Planner node function closed over *config* and *llm*.
-
-    Supports three structured-output strategies via config.llm_structured_output_method:
-    - "prompt"           : JSON schema embedded in system prompt; parse text response.
-                           Works with ALL models including DeepSeek-V4-Pro. (recommended)
-    - "json_schema"      : OpenAI json_schema response_format (GPT-4o, o-series only)
-    - "function_calling" : bind_tools without forced tool_choice.
-                           May confuse models when PlannerDecision contains generic dict fields.
-    """
-    method = config.llm_structured_output_method
-
-    if method == "function_calling":
-        # Bind PlannerDecision as a tool WITHOUT tool_choice so DeepSeek doesn't
-        # reject the request.  LangChain's with_structured_output forces
-        # tool_choice=<name> which DeepSeek rejects with a 400 error.
-        llm_with_tools = llm.bind_tools([PlannerDecision])
-        structured_llm = None
-        system_prompt = _SYSTEM_PROMPT
-    elif method == "prompt":
-        llm_with_tools = None
-        structured_llm = None
-        system_prompt = _SYSTEM_PROMPT + _JSON_SCHEMA_PROMPT
-    else:
-        # json_schema or any future method supported by with_structured_output
-        llm_with_tools = None
-        structured_llm = llm.with_structured_output(
-            PlannerDecision,
-            method=method,
-        )
-        system_prompt = _SYSTEM_PROMPT
-
-    def _parse_tool_call_response(response: Any) -> PlannerDecision:
-        """Parse a bind_tools response into PlannerDecision.
-
-        Tries tool_calls first, then falls back to JSON in content.
-        """
-        tool_calls = getattr(response, "tool_calls", None)
-        if tool_calls:
-            args = tool_calls[0]["args"]
-            return PlannerDecision(**args)
-        # Fallback: model replied in plain text instead of calling the tool
-        text = response.content if hasattr(response, "content") else str(response)
-        parsed = _extract_json(str(text))
-        return PlannerDecision(**parsed)
+    """Return a Planner node function closed over *config* and *llm*."""
+    llm_with_tools = _bind_model_tools(llm)
 
     def planner(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
-
-        plan_text = (
-            "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(state["plan"]))
-            or "  (not yet planned)"
+        prompt_message = HumanMessage(content=_format_planner_prompt(state, config))
+        history: list[BaseMessage] = state["messages"]
+        raw = llm_with_tools.invoke(
+            [SystemMessage(content=_SYSTEM_PROMPT), prompt_message, *history]
         )
-        obs_text = _fmt_observations(state["observations"])
+        response = _coerce_ai_message(raw)
+        tool_call = _build_tool_call(response, state)
+        current_step = _summarize_step(response, tool_call)
+        plan = _append_plan_step(state["plan"], current_step)
 
-        user_content = (
-            f"**Goal:** {state['user_goal']}\n\n"
-            f"**Workspace root:** {state['workspace_root']}\n\n"
-            f"**Current plan:**\n{plan_text}\n\n"
-            f"**Recent observations:**\n{obs_text}\n\n"
-            f"**Iterations used:** {state['iteration_count']} / {config.max_iterations}\n"
-            f"**Consecutive failures:** "
-            f"{state['consecutive_failures']} / {config.max_consecutive_failures}\n"
-        )
-
-        lc_messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_content),
-        ]
-
-        if method == "function_calling":
-            raw = llm_with_tools.invoke(lc_messages)  # type: ignore[union-attr]
-            try:
-                decision = _parse_tool_call_response(raw)
-            except Exception as exc:
-                decision = PlannerDecision(
-                    thought=f"Tool-call parse error: {exc}",
-                    plan=state["plan"],
-                    current_step="Parse error",
-                    final_answer=f"Agent encountered a response parse error: {exc}",
-                )
-        elif method == "prompt":
-            raw = llm.invoke(lc_messages)
-            text = raw.content if hasattr(raw, "content") else str(raw)
-            try:
-                parsed = _extract_json(str(text))
-                decision = PlannerDecision(**parsed)
-            except Exception as exc:
-                decision = PlannerDecision(
-                    thought=f"JSON parse error: {exc}",
-                    plan=state["plan"],
-                    current_step="Parse error",
-                    final_answer=f"Agent encountered a response parse error: {exc}",
-                )
-        else:
-            decision = structured_llm.invoke(lc_messages)  # type: ignore[union-attr,assignment]
-
-        # Guard: if neither tool nor answer was provided, force a final answer
-        if not decision.tool_name and not decision.final_answer:
-            decision = PlannerDecision(
-                thought=decision.thought,
-                plan=decision.plan,
-                current_step="Unable to determine next action",
-                final_answer=(
-                    "Agent could not determine how to proceed. "
-                    "Please refine your goal."
-                ),
-            )
-
-        # Build ToolCall when the planner wants a tool (not finishing yet)
-        tool_call: ToolCall | None = None
-        if decision.tool_name and not decision.final_answer:
-            tool_call = ToolCall(
-                name=decision.tool_name,
-                args=decision.tool_args,
-                risk_level="low",  # all phase-1 tools are read-only
+        final_answer: str | None = None
+        if tool_call is None:
+            final_answer = _content_to_text(response.content) or (
+                "Agent returned neither a tool call nor a final answer."
             )
 
         # ── Audit ────────────────────────────────────────────────────────
         _one_shot_audit(run_id, config.log_dir, EVENT_PLAN_UPDATE, {
-            "plan": decision.plan,
-            "current_step": decision.current_step,
-            "thought": decision.thought,
+            "plan": plan,
+            "current_step": current_step,
         })
         if tool_call:
             _one_shot_audit(run_id, config.log_dir, EVENT_TOOL_PROPOSED, {
@@ -334,25 +313,12 @@ def _make_planner(
                 "args": tool_call["args"],
             })
 
-        # ── Message for history ───────────────────────────────────────────
-        if decision.final_answer:
-            msg_content: str = "[Planner] Final answer ready."
-        else:
-            msg_content = (
-                f"[Planner] {decision.current_step}\n"
-                f"Tool: {decision.tool_name} {json.dumps(decision.tool_args)}"
-            )
-        assistant_msg: dict[str, object] = {
-            "role": "assistant",
-            "content": msg_content,
-        }
-
         return {
-            "messages": [assistant_msg],
-            "plan": decision.plan,
-            "current_step": decision.current_step,
+            "messages": [response],
+            "plan": plan,
+            "current_step": current_step,
             "proposed_tool_call": tool_call,
-            "final_answer": decision.final_answer,
+            "final_answer": final_answer,
         }
 
     return planner
@@ -380,17 +346,8 @@ def _make_policy_guard(
         })
 
         if decision == "deny":
-            # Inject a message explaining the denial
-            deny_msg: dict[str, object] = {
-                "role": "assistant",
-                "content": (
-                    f"[PolicyGuard] Denied tool call '{tc['name']}' "
-                    f"with args {json.dumps(tc['args'])}."
-                ),
-            }
             return {
                 "risk_decision": "deny",
-                "messages": [deny_msg],
                 "final_answer": (
                     f"Operation denied by security policy: "
                     f"tool '{tc['name']}' with args {tc['args']} is not permitted."
@@ -432,6 +389,7 @@ def _make_tool_executor(
                 "observations": state["observations"] + [obs],
                 "iteration_count": state["iteration_count"] + 1,
                 "consecutive_failures": state["consecutive_failures"] + 1,
+                "proposed_tool_call": None,
             }
 
         skill_fn = _SKILL_DISPATCH.get(tc["name"])
@@ -496,9 +454,16 @@ def _make_tool_executor(
         new_failures = 0 if obs["ok"] else state["consecutive_failures"] + 1
 
         return {
+            "messages": [
+                ToolMessage(
+                    content=_serialize_tool_payload(obs),
+                    tool_call_id=tc["id"],
+                )
+            ],
             "observations": state["observations"] + [obs],
             "iteration_count": state["iteration_count"] + 1,
             "consecutive_failures": new_failures,
+            "proposed_tool_call": None,
         }
 
     return tool_executor

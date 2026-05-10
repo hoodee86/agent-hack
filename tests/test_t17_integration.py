@@ -1,35 +1,20 @@
-"""
-T17 – End-to-end integration tests.
-
-These tests exercise the full agent pipeline (graph + skills) using a stub
-LangChain model so no real API key is required.  Five canonical scenarios:
-
-1. list_dir  – agent lists a directory and reports the files
-2. read_file – agent reads a file and reports its content
-3. search    – agent finds a token with search_text
-4. security block – agent attempts a path traversal; PolicyGuard denies it
-5. iteration limit – planner loops; Reflector stops the run at max_iterations
-
-All scenarios verify: final_answer produced, iteration count, observations,
-and (for scenario 4) zero tool executions.
-"""
+"""T17 – End-to-end integration tests."""
 
 from __future__ import annotations
 
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 from unittest.mock import MagicMock
 
-import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 
 from linux_agent.config import AgentConfig
-from linux_agent.graph import PlannerDecision, build_graph
+from linux_agent.graph import build_graph
 from linux_agent.state import AgentState
 
 
@@ -58,10 +43,33 @@ def _initial_state(goal: str, workspace_root: str) -> AgentState:
     )
 
 
-class _CyclicStubLLM(BaseChatModel):
-    """Cycles through a list of PlannerDecisions; repeats the last one."""
+class _StubTurn(TypedDict):
+    content: str
+    tool_name: str | None
+    tool_args: dict[str, object]
 
-    decisions: list[PlannerDecision]
+
+def _tool_turn(
+    tool_name: str,
+    tool_args: dict[str, object],
+    *,
+    content: str = "",
+) -> _StubTurn:
+    return {
+        "content": content,
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+    }
+
+
+def _final_turn(content: str) -> _StubTurn:
+    return {"content": content, "tool_name": None, "tool_args": {}}
+
+
+class _CyclicStubLLM(BaseChatModel):
+    """Cycles through a list of tool-calling turns; repeats the last one."""
+
+    turns: list[_StubTurn]
     _call_count: int = 0
 
     @property
@@ -78,18 +86,20 @@ class _CyclicStubLLM(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=MagicMock())])
 
     def bind_tools(self, tools: Any, *, tool_choice: Any = None, **kwargs: Any) -> Any:  # type: ignore[override]
-        decisions = self.decisions
+        turns = self.turns
 
         def _invoke(messages: Any, **kw: Any) -> AIMessage:
-            idx = min(self._call_count, len(decisions) - 1)
+            idx = min(self._call_count, len(turns) - 1)
             self._call_count += 1  # type: ignore[misc]
-            decision = decisions[idx]
+            turn = turns[idx]
+            if turn["tool_name"] is None:
+                return AIMessage(content=turn["content"])
             return AIMessage(
-                content="",
+                content=turn["content"],
                 tool_calls=[
                     {
-                        "name": "PlannerDecision",
-                        "args": decision.model_dump(),
+                        "name": turn["tool_name"],
+                        "args": turn["tool_args"],
                         "id": f"call_{idx}",
                         "type": "tool_call",
                     }
@@ -98,19 +108,9 @@ class _CyclicStubLLM(BaseChatModel):
 
         return RunnableLambda(_invoke)
 
-    def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:  # type: ignore[override]
-        decisions = self.decisions
 
-        def _invoke(messages: Any, **kw: Any) -> PlannerDecision:
-            idx = min(self._call_count, len(decisions) - 1)
-            self._call_count += 1  # type: ignore[misc]
-            return decisions[idx]
-
-        return RunnableLambda(_invoke)
-
-
-def _stub(*decisions: PlannerDecision) -> _CyclicStubLLM:
-    return _CyclicStubLLM(decisions=list(decisions))
+def _stub(*turns: _StubTurn) -> _CyclicStubLLM:
+    return _CyclicStubLLM(turns=list(turns))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,19 +127,8 @@ class TestScenarioListDir:
 
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Let me list the workspace root first.",
-                plan=["List workspace", "Report"],
-                current_step="Listing workspace root",
-                tool_name="list_dir",
-                tool_args={"path": "."},
-            ),
-            PlannerDecision(
-                thought="I have the listing; I can answer now.",
-                plan=["List workspace", "Report"],
-                current_step="Reporting",
-                final_answer="Files: README.md, main.py, sub/",
-            ),
+            _tool_turn("list_dir", {"path": "."}, content="Listing workspace root"),
+            _final_turn("Files: README.md, main.py, sub/"),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("What files are in the workspace?", str(tmp_path)))
@@ -163,19 +152,12 @@ class TestScenarioListDir:
 
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Recurse.",
-                plan=["Recursive list"],
-                current_step="Recursive listing",
-                tool_name="list_dir",
-                tool_args={"path": ".", "recursive": True},
+            _tool_turn(
+                "list_dir",
+                {"path": ".", "recursive": True},
+                content="Recursive listing",
             ),
-            PlannerDecision(
-                thought="Done.",
-                plan=["Recursive list"],
-                current_step="Reporting",
-                final_answer="Found deep.py",
-            ),
+            _final_turn("Found deep.py"),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Find all files", str(tmp_path)))
@@ -196,19 +178,8 @@ class TestScenarioReadFile:
         readme.write_text("# My Project\n\nThis is a test.\n")
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Read README.",
-                plan=["Read README", "Report"],
-                current_step="Reading README.md",
-                tool_name="read_file",
-                tool_args={"path": "README.md"},
-            ),
-            PlannerDecision(
-                thought="Got the content.",
-                plan=["Read README", "Report"],
-                current_step="Reporting",
-                final_answer="README says: My Project",
-            ),
+            _tool_turn("read_file", {"path": "README.md"}, content="Reading README.md"),
+            _final_turn("README says: My Project"),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("What is in README.md?", str(tmp_path)))
@@ -224,19 +195,12 @@ class TestScenarioReadFile:
         f.write_text("\n".join(f"# line {i}" for i in range(1, 21)) + "\n")
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Read lines 5-10.",
-                plan=["Read range"],
-                current_step="Reading lines 5-10",
-                tool_name="read_file",
-                tool_args={"path": "code.py", "start_line": 5, "end_line": 10},
+            _tool_turn(
+                "read_file",
+                {"path": "code.py", "start_line": 5, "end_line": 10},
+                content="Reading lines 5-10",
             ),
-            PlannerDecision(
-                thought="Got it.",
-                plan=["Read range"],
-                current_step="Reporting",
-                final_answer="Seen lines 5-10",
-            ),
+            _final_turn("Seen lines 5-10"),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Read lines 5-10", str(tmp_path)))
@@ -259,19 +223,12 @@ class TestScenarioSearchText:
         (tmp_path / "utils.py").write_text("def helper():\n    pass\n")
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Search for calculate.",
-                plan=["Search"],
-                current_step="Searching for 'def calculate'",
-                tool_name="search_text",
-                tool_args={"query": "def calculate"},
+            _tool_turn(
+                "search_text",
+                {"query": "def calculate"},
+                content="Searching for def calculate",
             ),
-            PlannerDecision(
-                thought="Found it.",
-                plan=["Search"],
-                current_step="Reporting",
-                final_answer="Found in main.py",
-            ),
+            _final_turn("Found in main.py"),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Where is calculate defined?", str(tmp_path)))
@@ -287,19 +244,12 @@ class TestScenarioSearchText:
         (tmp_path / "b.md").write_text("TOKEN_HERE")
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Search only .py files.",
-                plan=["Search"],
-                current_step="Searching .py files",
-                tool_name="search_text",
-                tool_args={"query": "TOKEN_HERE", "glob": "**/*.py"},
+            _tool_turn(
+                "search_text",
+                {"query": "TOKEN_HERE", "glob": "**/*.py"},
+                content="Searching .py files",
             ),
-            PlannerDecision(
-                thought="Done.",
-                plan=["Search"],
-                current_step="Reporting",
-                final_answer="Found in .py files",
-            ),
+            _final_turn("Found in .py files"),
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Find TOKEN in py files", str(tmp_path)))
@@ -319,13 +269,11 @@ class TestScenarioSecurityBlock:
         """The agent must NOT execute any tool when PolicyGuard denies."""
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Try to read /etc/passwd",
-                plan=["Escape"],
-                current_step="Reading /etc/passwd",
-                tool_name="read_file",
-                tool_args={"path": "../../../../etc/passwd"},
-            ),
+            _tool_turn(
+                "read_file",
+                {"path": "../../../../etc/passwd"},
+                content="Reading /etc/passwd",
+            )
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Read /etc/passwd", str(tmp_path)))
@@ -342,13 +290,11 @@ class TestScenarioSecurityBlock:
         (tmp_path / ".ssh" / "id_rsa").write_text("fake key")
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Read ssh key",
-                plan=["Read key"],
-                current_step="Reading .ssh/id_rsa",
-                tool_name="read_file",
-                tool_args={"path": ".ssh/id_rsa"},
-            ),
+            _tool_turn(
+                "read_file",
+                {"path": ".ssh/id_rsa"},
+                content="Reading .ssh/id_rsa",
+            )
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Read SSH key", str(tmp_path)))
@@ -360,13 +306,11 @@ class TestScenarioSecurityBlock:
         """A non-read-only tool is rejected without any tool execution."""
         cfg = _make_config(tmp_path)
         llm = _stub(
-            PlannerDecision(
-                thought="Write a file",
-                plan=["Write"],
-                current_step="Writing evil.sh",
-                tool_name="write_file",
-                tool_args={"path": "evil.sh", "content": "rm -rf /"},
-            ),
+            _tool_turn(
+                "write_file",
+                {"path": "evil.sh", "content": "rm -rf /"},
+                content="Writing evil.sh",
+            )
         )
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Write file", str(tmp_path)))
@@ -384,13 +328,7 @@ class TestScenarioIterationLimit:
         """Reflector must stop the agent when max_iterations is reached."""
         (tmp_path / "f.txt").write_text("x")
         cfg = _make_config(tmp_path, max_iterations=3)
-        always_list = PlannerDecision(
-            thought="Keep listing forever",
-            plan=["Loop"],
-            current_step="Listing (loop)",
-            tool_name="list_dir",
-            tool_args={"path": "."},
-        )
+        always_list = _tool_turn("list_dir", {"path": "."}, content="Listing (loop)")
         app = build_graph(cfg, chat_model=_stub(always_list))
         result = app.invoke(_initial_state("Loop forever", str(tmp_path)))
 
@@ -403,12 +341,10 @@ class TestScenarioIterationLimit:
     def test_consecutive_failure_limit(self, tmp_path: Path) -> None:
         """Reflector stops when max_consecutive_failures is reached."""
         cfg = _make_config(tmp_path, max_consecutive_failures=2)
-        always_fail = PlannerDecision(
-            thought="Read nonexistent file",
-            plan=["Fail"],
-            current_step="Reading ghost.txt",
-            tool_name="read_file",
-            tool_args={"path": "ghost.txt"},
+        always_fail = _tool_turn(
+            "read_file",
+            {"path": "ghost.txt"},
+            content="Reading ghost.txt",
         )
         app = build_graph(cfg, chat_model=_stub(always_fail))
         result = app.invoke(_initial_state("Read ghost", str(tmp_path)))
@@ -433,19 +369,8 @@ class TestScenarioAuditLog:
 
         (tmp_path / "hello.txt").write_text("hi")
         llm = _stub(
-            PlannerDecision(
-                thought="Read hello.txt",
-                plan=["Read", "Report"],
-                current_step="Reading hello.txt",
-                tool_name="read_file",
-                tool_args={"path": "hello.txt"},
-            ),
-            PlannerDecision(
-                thought="Done.",
-                plan=["Read", "Report"],
-                current_step="Reporting",
-                final_answer="Content: hi",
-            ),
+            _tool_turn("read_file", {"path": "hello.txt"}, content="Reading hello.txt"),
+            _final_turn("Content: hi"),
         )
         app = build_graph(cfg, chat_model=llm)
         initial = AgentState(

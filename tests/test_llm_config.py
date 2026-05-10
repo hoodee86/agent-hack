@@ -22,6 +22,7 @@ def test_load_config_reads_deepseek_env_vars(
     config = load_config(str(config_file))
 
     assert config.workspace_root == tmp_path.resolve()
+    assert config.llm_model == "deepseek-v4-pro"
     assert config.llm_base_url == "https://api.deepseek.com/v1"
     assert config.llm_api_key == "deepseek-test-key"
 
@@ -32,7 +33,7 @@ def test_load_config_yaml_overrides_env(tmp_path: Path, monkeypatch) -> None:
         "\n".join(
             [
                 "workspace_root: .",
-                "llm_model: deepseek-chat",
+                "llm_model: deepseek-v4-pro",
                 "llm_base_url: https://custom.example/v1",
                 "llm_api_key: yaml-key",
             ]
@@ -46,7 +47,7 @@ def test_load_config_yaml_overrides_env(tmp_path: Path, monkeypatch) -> None:
 
     config = load_config(str(config_file))
 
-    assert config.llm_model == "deepseek-chat"
+    assert config.llm_model == "deepseek-v4-pro"
     assert config.llm_base_url == "https://custom.example/v1"
     assert config.llm_api_key == "yaml-key"
 
@@ -57,8 +58,8 @@ def test_build_graph_passes_provider_config_to_chatopenai(tmp_path: Path) -> Non
         "\n".join(
             [
                 "workspace_root: .",
-                "llm_model: deepseek-chat",
-                "llm_base_url: https://api.deepseek.com/v1",
+                "llm_model: deepseek-v4-pro",
+                "llm_base_url: https://api.deepseek.com",
                 "llm_api_key: deepseek-test-key",
             ]
         )
@@ -71,8 +72,8 @@ def test_build_graph_passes_provider_config_to_chatopenai(tmp_path: Path) -> Non
         build_graph(config)
 
     chat_openai.assert_called_once_with(
-        model="deepseek-chat",
+        model="deepseek-v4-pro",
         temperature=0.0,
-        base_url="https://api.deepseek.com/v1",
+        base_url="https://api.deepseek.com",
         api_key="deepseek-test-key",
     )

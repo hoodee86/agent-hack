@@ -119,22 +119,6 @@ def resolve_safe_path(
     return resolved
 
 
-# ── Tool-level checks ────────────────────────────────────────────────────
-def check_read_only_tool(tool_name: str) -> None:
-    """
-    Assert that *tool_name* is a phase-1 read-only tool.
-
-    Raises
-    ------
-    PolicyViolation
-        If the tool is not in the read-only allowlist.
-    """
-    if tool_name not in READ_ONLY_TOOLS:
-        raise PolicyViolation(
-            f"tool '{tool_name}' is not permitted in phase 1 (read-only)",
-        )
-
-
 def evaluate_tool_call(
     tool_call: "ToolCall",
     config: "AgentConfig",

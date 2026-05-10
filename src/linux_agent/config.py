@@ -37,15 +37,12 @@ class AgentConfig(BaseModel):
     max_list_entries: int = Field(default=200, ge=1)
 
     # --- LLM -------------------------------------------------------------
-    llm_model: str = "gpt-4o"
+    llm_model: str = "deepseek-v4-pro"
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    # OpenAI-compatible base URL, e.g. https://api.deepseek.com/v1
-    llm_base_url: str | None = None
+    # OpenAI-compatible base URL for DeepSeek's chat-completions endpoint.
+    llm_base_url: str | None = "https://api.deepseek.com"
     # API key for the configured provider; prefer env vars in practice
     llm_api_key: str | None = None
-    # Structured-output method: "function_calling" (DeepSeek / most providers)
-    # or "json_schema" (OpenAI o-series / GPT-4o).  Default: function_calling.
-    llm_structured_output_method: str = "function_calling"
 
     # --- Security --------------------------------------------------------
     # Path components (str) that are never allowed, regardless of workspace
@@ -103,7 +100,7 @@ def load_config(path: str | None = None) -> AgentConfig:
 
     Resolution order (highest priority first):
     1. YAML file fields (when *path* is given)
-    2. LINUX_AGENT_WORKSPACE environment variable (for workspace_root)
+    2. Environment variables for workspace / provider credentials
     3. Built-in defaults
 
     Raises
