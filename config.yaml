@@ -3,6 +3,57 @@ max_iterations: 12
 max_read_bytes: 65536
 max_search_results: 100
 max_list_entries: 200
+default_timeout_seconds: 120
+max_output_bytes: 65536
+max_stderr_bytes: 32768
+command_allowlist:
+	- uv run pytest
+	- uv run mypy
+	- uv run ruff
+	- pytest
+	- python -m pytest
+	- mypy
+	- python -m mypy
+	- ruff
+	- python -m ruff
+	- git status
+	- git diff
+	- git --no-pager diff
+	- ls
+	- pwd
+	- find
+	- rg
+command_denylist:
+	- sudo
+	- su
+	- sh -c
+	- bash -c
+	- zsh -c
+	- python -c
+	- python3 -c
+	- rm
+	- mv
+	- chmod
+	- chown
+	- curl
+	- wget
+	- ssh
+	- scp
+	- rsync
+	- dd
+	- mkfs
+	- systemctl
+	- crontab
+command_env_allowlist:
+	- CI
+	- FORCE_COLOR
+	- MYPYPATH
+	- NO_COLOR
+	- PYTEST_ADDOPTS
+	- PYTHONPATH
+	- RUFF_OUTPUT_FORMAT
+command_working_dirs:
+	- .
 llm_model: deepseek-v4-pro
 llm_temperature: 0.0
 llm_base_url: https://api.deepseek.com

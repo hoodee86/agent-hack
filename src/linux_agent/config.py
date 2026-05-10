@@ -36,6 +36,76 @@ class AgentConfig(BaseModel):
     # Maximum number of directory entries returned by list_dir
     max_list_entries: int = Field(default=200, ge=1)
 
+    # --- Command execution limits ---------------------------------------
+    # Default timeout applied by run_command when the caller omits one
+    default_timeout_seconds: int = Field(default=120, ge=1)
+    # Maximum bytes returned for stdout before truncation
+    max_output_bytes: int = Field(default=65536, ge=1)
+    # Maximum bytes returned for stderr before truncation
+    max_stderr_bytes: int = Field(default=32768, ge=1)
+    # Low-risk command prefixes that are allowed in phase 2
+    command_allowlist: list[str] = Field(
+        default_factory=lambda: [
+            "uv run pytest",
+            "uv run mypy",
+            "uv run ruff",
+            "pytest",
+            "python -m pytest",
+            "mypy",
+            "python -m mypy",
+            "ruff",
+            "python -m ruff",
+            "git status",
+            "git diff",
+            "git --no-pager diff",
+            "ls",
+            "pwd",
+            "find",
+            "rg",
+        ]
+    )
+    # Explicitly denied command prefixes or executables
+    command_denylist: list[str] = Field(
+        default_factory=lambda: [
+            "sudo",
+            "su",
+            "sh -c",
+            "bash -c",
+            "zsh -c",
+            "python -c",
+            "python3 -c",
+            "rm",
+            "mv",
+            "chmod",
+            "chown",
+            "curl",
+            "wget",
+            "ssh",
+            "scp",
+            "rsync",
+            "dd",
+            "mkfs",
+            "systemctl",
+            "crontab",
+        ]
+    )
+    # Reserved for later approval-based phases; phase 2 still denies them
+    command_approvallist: list[str] = Field(default_factory=list)
+    # Only these env vars may be forwarded to run_command
+    command_env_allowlist: list[str] = Field(
+        default_factory=lambda: [
+            "CI",
+            "FORCE_COLOR",
+            "MYPYPATH",
+            "NO_COLOR",
+            "PYTEST_ADDOPTS",
+            "PYTHONPATH",
+            "RUFF_OUTPUT_FORMAT",
+        ]
+    )
+    # Workspace-relative directories where commands may execute
+    command_working_dirs: list[str] = Field(default_factory=lambda: ["."])
+
     # --- LLM -------------------------------------------------------------
     llm_model: str = "deepseek-v4-pro"
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -79,6 +149,36 @@ class AgentConfig(BaseModel):
         if isinstance(v, str) and not v.strip():
             return None
         return str(v)
+
+    @field_validator(
+        "command_allowlist",
+        "command_denylist",
+        "command_approvallist",
+        "command_env_allowlist",
+        "command_working_dirs",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_string_lists(cls, v: Any) -> list[str]:
+        if v is None:
+            return []
+        if isinstance(v, str):
+            items = [v]
+        else:
+            try:
+                items = list(v)
+            except TypeError:
+                items = [v]
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            normalized.append(text)
+            seen.add(text)
+        return normalized
 
     @model_validator(mode="after")
     def _validate_workspace_exists(self) -> "AgentConfig":

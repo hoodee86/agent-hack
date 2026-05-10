@@ -8,7 +8,9 @@ stateless so they are easy to unit-test in isolation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
+import shlex
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -17,6 +19,19 @@ if TYPE_CHECKING:
 
 # ── Phase-1 read-only tool allowlist ──────────────────────────────────────
 READ_ONLY_TOOLS: frozenset[str] = frozenset({"list_dir", "read_file", "search_text"})
+COMMAND_EXECUTION_TOOLS: frozenset[str] = frozenset({"run_command"})
+_UNSAFE_SHELL_PATTERNS: tuple[str, ...] = (
+    "&&",
+    "||",
+    ">>",
+    ";",
+    "|",
+    ">",
+    "<",
+    "`",
+    "$(",
+    "&",
+)
 
 
 # ── Exception ────────────────────────────────────────────────────────────
@@ -119,6 +134,135 @@ def resolve_safe_path(
     return resolved
 
 
+def parse_command(raw: str) -> list[str]:
+    """Parse a command string conservatively and reject shell control syntax."""
+    normalized = raw.strip()
+    if not normalized:
+        raise PolicyViolation("command is empty")
+
+    if any(pattern in normalized for pattern in _UNSAFE_SHELL_PATTERNS):
+        raise PolicyViolation("unsupported shell syntax in command", path=raw)
+
+    try:
+        argv = shlex.split(normalized, posix=True)
+    except ValueError as exc:
+        raise PolicyViolation(f"failed to parse command: {exc}", path=raw) from exc
+
+    if not argv:
+        raise PolicyViolation("command is empty")
+
+    return argv
+
+
+def _normalize_command_text(argv: list[str]) -> str:
+    return " ".join(part.strip() for part in argv if part.strip())
+
+
+def _matches_command_prefix(command: str, patterns: list[str] | frozenset[str]) -> bool:
+    for pattern in patterns:
+        normalized = pattern.strip()
+        if not normalized:
+            continue
+        if command == normalized or command.startswith(f"{normalized} "):
+            return True
+    return False
+
+
+def _unwrap_uv_run(argv: list[str]) -> list[str] | None:
+    if len(argv) >= 4 and argv[0] == "uv" and argv[1] == "run" and argv[2] == "--":
+        return argv[3:]
+    if len(argv) >= 3 and argv[0] == "uv" and argv[1] == "run":
+        return argv[2:]
+    return None
+
+
+def classify_command(
+    argv: list[str],
+    config: "AgentConfig",
+) -> Literal["low", "medium", "high"]:
+    """Classify a parsed command according to the configured command policy."""
+    normalized = _normalize_command_text(argv)
+    if not normalized:
+        return "high"
+
+    inner = _unwrap_uv_run(argv)
+    if inner:
+        inner_risk = classify_command(inner, config)
+        if inner_risk != "high":
+            return inner_risk
+
+    if _matches_command_prefix(normalized, config.command_denylist):
+        return "high"
+    if _matches_command_prefix(normalized, config.command_approvallist):
+        return "medium"
+    if _matches_command_prefix(normalized, config.command_allowlist):
+        return "low"
+    return "high"
+
+
+def resolve_command_cwd(
+    config: "AgentConfig",
+    cwd: str | None = None,
+) -> Path:
+    """Resolve a run_command cwd and ensure it stays within allowed directories."""
+    raw_cwd = cwd or "."
+    resolved_cwd = resolve_safe_path(
+        config.workspace_root,
+        raw_cwd,
+        config.sensitive_path_parts,
+    )
+
+    allowed_dirs = config.command_working_dirs or ["."]
+    for allowed in allowed_dirs:
+        allowed_path = resolve_safe_path(
+            config.workspace_root,
+            allowed,
+            config.sensitive_path_parts,
+        )
+        if resolved_cwd == allowed_path or allowed_path in resolved_cwd.parents:
+            return resolved_cwd
+
+    raise PolicyViolation("command cwd is not in allowed working directories", path=raw_cwd)
+
+
+def filter_command_env(
+    env: Mapping[str, object] | None,
+    allowed_names: list[str] | frozenset[str],
+) -> dict[str, str]:
+    """Keep only explicitly allowlisted env vars for command execution."""
+    if not env:
+        return {}
+
+    allowset = frozenset(str(name) for name in allowed_names)
+    filtered: dict[str, str] = {}
+    for key, value in env.items():
+        key_text = str(key)
+        if key_text not in allowset:
+            continue
+        filtered[key_text] = str(value)
+    return filtered
+
+
+def evaluate_command_call(
+    command: str,
+    config: "AgentConfig",
+    *,
+    cwd: str = ".",
+    env: Mapping[str, object] | None = None,
+) -> Literal["allow", "deny"]:
+    """Evaluate whether a run_command call should be permitted in phase 2."""
+    try:
+        argv = parse_command(command)
+        resolve_command_cwd(config, cwd)
+        if env is not None and not isinstance(env, Mapping):
+            return "deny"
+        risk = classify_command(argv, config)
+    except PolicyViolation:
+        return "deny"
+
+    return "allow" if risk == "low" else "deny"
+
+
 def evaluate_tool_call(
     tool_call: "ToolCall",
     config: "AgentConfig",
@@ -134,6 +278,21 @@ def evaluate_tool_call(
     args: dict[str, object] = tool_call["args"]
 
     # ── 1. Tool allowlist ───────────────────────────────────────────
+    if name in COMMAND_EXECUTION_TOOLS:
+        raw_command = args.get("command")
+        if not isinstance(raw_command, str):
+            return "deny"
+        raw_cwd = args.get("cwd", ".")
+        raw_env = args.get("env")
+        if raw_env is not None and not isinstance(raw_env, Mapping):
+            return "deny"
+        return evaluate_command_call(
+            raw_command,
+            config,
+            cwd=str(raw_cwd) if raw_cwd is not None else ".",
+            env=raw_env,
+        )
+
     if name not in READ_ONLY_TOOLS:
         return "deny"
 
