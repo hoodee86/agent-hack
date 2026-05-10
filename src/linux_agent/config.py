@@ -43,6 +43,9 @@ class AgentConfig(BaseModel):
     llm_base_url: str | None = None
     # API key for the configured provider; prefer env vars in practice
     llm_api_key: str | None = None
+    # Structured-output method: "function_calling" (DeepSeek / most providers)
+    # or "json_schema" (OpenAI o-series / GPT-4o).  Default: function_calling.
+    llm_structured_output_method: str = "function_calling"
 
     # --- Security --------------------------------------------------------
     # Path components (str) that are never allowed, regardless of workspace

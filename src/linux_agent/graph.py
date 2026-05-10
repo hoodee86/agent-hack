@@ -156,7 +156,10 @@ def _make_planner(
 ) -> Callable[[AgentState], dict[str, Any]]:
     """Return a Planner node function closed over *config* and *llm*."""
 
-    structured_llm = llm.with_structured_output(PlannerDecision)
+    structured_llm = llm.with_structured_output(
+        PlannerDecision,
+        method=config.llm_structured_output_method,
+    )
 
     def planner(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
