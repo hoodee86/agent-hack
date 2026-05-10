@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import shutil
+import threading
 import textwrap
 from pathlib import Path
 
@@ -15,6 +18,7 @@ from linux_agent.policy import (
     evaluate_tool_call,
     filter_command_env,
     parse_command,
+    parse_command_sequence,
     resolve_command_cwd,
 )
 from linux_agent.skills.shell import run_command
@@ -44,6 +48,8 @@ class TestT18Config:
         assert config.max_output_bytes == 65536
         assert config.max_stderr_bytes == 32768
         assert "uv run pytest" in config.command_allowlist
+        assert "cat" in config.command_allowlist
+        assert "uniq" in config.command_allowlist
         assert "sudo" in config.command_denylist
         assert config.command_working_dirs == ["."]
 
@@ -83,6 +89,31 @@ class TestT19CommandPolicy:
     def test_parse_command_allows_simple_argv(self) -> None:
         assert parse_command("uv run pytest -q") == ["uv", "run", "pytest", "-q"]
 
+    def test_parse_command_sequence_allows_compound_commands(self) -> None:
+        segments = parse_command_sequence("pwd && echo done ; ls")
+
+        assert segments == [
+            {"operator": None, "argv": ["pwd"], "command": "pwd"},
+            {"operator": "&&", "argv": ["echo", "done"], "command": "echo done"},
+            {"operator": ";", "argv": ["ls"], "command": "ls"},
+        ]
+
+    def test_parse_command_sequence_allows_pipeline_segments(self) -> None:
+        segments = parse_command_sequence("pwd | cat && echo done")
+
+        assert segments == [
+            {
+                "operator": None,
+                "argv": ["pwd"],
+                "command": "pwd | cat",
+                "stages": [
+                    {"argv": ["pwd"], "command": "pwd"},
+                    {"argv": ["cat"], "command": "cat"},
+                ],
+            },
+            {"operator": "&&", "argv": ["echo", "done"], "command": "echo done"},
+        ]
+
     def test_parse_command_rejects_shell_control_syntax(self) -> None:
         with pytest.raises(Exception, match="unsupported shell syntax"):
             parse_command("pytest -q > out.txt")
@@ -120,6 +151,42 @@ class TestT19CommandPolicy:
     def test_evaluate_command_call_denies_workspace_escape(self, tmp_path: Path) -> None:
         config = make_config(tmp_path)
         assert evaluate_command_call("pwd", config, cwd="..") == "deny"
+
+    def test_evaluate_command_call_allows_allowlisted_compound_command(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["pwd", "echo"],
+            command_denylist=[],
+        )
+
+        assert evaluate_command_call("pwd && echo done", config) == "allow"
+
+    def test_evaluate_command_call_allows_allowlisted_pipeline(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["pwd", "cat"],
+            command_denylist=[],
+        )
+
+        assert evaluate_command_call("pwd | cat", config) == "allow"
+
+    def test_evaluate_command_call_denies_compound_command_if_any_segment_is_high_risk(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["pwd"],
+            command_denylist=["rm"],
+        )
+
+        assert evaluate_command_call("pwd && rm -rf tmp", config) == "deny"
+
+    def test_evaluate_command_call_allows_allowlisted_curl_prefix(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -s"],
+            command_denylist=["curl"],
+        )
+
+        assert evaluate_command_call("curl -s https://example.com", config) == "allow"
 
     @pytest.mark.parametrize(
         "command",
@@ -184,6 +251,50 @@ class TestT20RunCommand:
         assert str(tmp_path) in result["stdout"]
         assert result["timed_out"] is False
         assert result["error"] is None
+
+    def test_run_command_executes_compound_command_segments_in_order(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["pwd", "echo"],
+            command_denylist=[],
+        )
+
+        result = run_command("pwd && echo done", config)
+
+        assert result["ok"] is True
+        assert result["exit_code"] == 0
+        assert str(tmp_path) in result["stdout"]
+        assert "done" in result["stdout"]
+        assert [segment["exit_code"] for segment in result["command_segments"]] == [0, 0]
+
+    def test_run_command_executes_pipeline(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["pwd", "cat"],
+            command_denylist=[],
+        )
+
+        result = run_command("pwd | cat", config)
+
+        assert result["ok"] is True
+        assert result["exit_code"] == 0
+        assert str(tmp_path) in result["stdout"]
+        assert len(result["command_segments"]) == 1
+        assert [stage["exit_code"] for stage in result["command_segments"][0]["pipeline_stages"]] == [0, 0]
+
+    def test_run_command_skips_and_segment_after_failure(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["find", "echo"],
+            command_denylist=[],
+        )
+
+        result = run_command("find missing-dir && echo done", config)
+
+        assert result["ok"] is False
+        assert result["exit_code"] not in (None, 0)
+        assert result["command_segments"][0]["skipped"] is False
+        assert result["command_segments"][1]["skipped"] is True
 
     def test_run_command_failure_preserves_exit_code_and_error(self, tmp_path: Path) -> None:
         config = make_config(tmp_path)
@@ -278,3 +389,75 @@ class TestT20RunCommand:
         assert result["ok"] is True
         assert result["exit_code"] == 0
         assert "1 passed" in result["stdout"]
+
+    @pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed")
+    def test_run_command_supports_allowlisted_curl(self, tmp_path: Path) -> None:
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b"linux-agent-curl-ok\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = make_config(
+                tmp_path,
+                command_allowlist=["curl -s"],
+                command_denylist=["curl"],
+            )
+
+            result = run_command(f"curl -s http://127.0.0.1:{port}/", config)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        assert result["ok"] is True
+        assert result["exit_code"] == 0
+        assert "linux-agent-curl-ok" in result["stdout"]
+
+    @pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed")
+    def test_run_command_supports_allowlisted_curl_pipeline(self, tmp_path: Path) -> None:
+        body = b"linux-agent-curl-pipe\n"
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = make_config(
+                tmp_path,
+                command_allowlist=["curl -s", "wc -c"],
+                command_denylist=["curl"],
+            )
+
+            result = run_command(f"curl -s http://127.0.0.1:{port}/ | wc -c", config)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        assert result["ok"] is True
+        assert result["exit_code"] == 0
+        assert str(len(body)) in result["stdout"]
+        assert [stage["exit_code"] for stage in result["command_segments"][0]["pipeline_stages"]] == [0, 0]

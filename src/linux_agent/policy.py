@@ -12,10 +12,10 @@ from collections.abc import Mapping
 from pathlib import Path
 import re
 import shlex
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 if TYPE_CHECKING:
     from linux_agent.config import AgentConfig
@@ -25,18 +25,12 @@ if TYPE_CHECKING:
 READ_ONLY_TOOLS: frozenset[str] = frozenset({"list_dir", "read_file", "search_text"})
 COMMAND_EXECUTION_TOOLS: frozenset[str] = frozenset({"run_command"})
 WRITE_APPROVAL_TOOLS: frozenset[str] = frozenset({"apply_patch", "write_file"})
-_UNSAFE_SHELL_PATTERNS: tuple[str, ...] = (
-    "&&",
-    "||",
-    ">>",
-    ";",
-    "|",
-    ">",
-    "<",
+_RAW_UNSAFE_SHELL_PATTERNS: tuple[str, ...] = (
     "`",
     "$(",
-    "&",
 )
+_SUPPORTED_SEQUENCE_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";"})
+_SUPPORTED_PIPE_OPERATOR = "|"
 _BINARY_PATH_SUFFIXES: frozenset[str] = frozenset(
     {
         ".7z",
@@ -72,12 +66,28 @@ _UNIFIED_DIFF_PATH_RE = re.compile(r"^(?:--- a/|\+\+\+ b/)(.+)$", re.MULTILINE)
 _PATCH_HUNK_RE = re.compile(r"^@@", re.MULTILINE)
 
 
+class CommandStage(TypedDict):
+    """One argv stage inside a parsed command segment."""
+
+    argv: list[str]
+    command: str
+
+
 class PolicyAssessment(TypedDict):
     """Structured policy output consumed by Policy Guard and tests."""
 
     decision: Literal["allow", "deny", "needs_approval"]
     reason: str | None
     approval_request: ApprovalRequest | None
+
+
+class CommandSegment(TypedDict):
+    """One parsed command segment inside a compound command string."""
+
+    operator: Literal["&&", "||", ";"] | None
+    argv: list[str]
+    command: str
+    stages: NotRequired[list[CommandStage]]
 
 
 # ── Exception ────────────────────────────────────────────────────────────
@@ -196,24 +206,111 @@ def resolve_safe_path(
     return resolved
 
 
-def parse_command(raw: str) -> list[str]:
-    """Parse a command string conservatively and reject shell control syntax."""
+def _tokenize_command(raw: str) -> list[str]:
     normalized = raw.strip()
     if not normalized:
         raise PolicyViolation("command is empty")
 
-    if any(pattern in normalized for pattern in _UNSAFE_SHELL_PATTERNS):
+    if any(pattern in normalized for pattern in _RAW_UNSAFE_SHELL_PATTERNS):
         raise PolicyViolation("unsupported shell syntax in command", path=raw)
 
     try:
-        argv = shlex.split(normalized, posix=True)
+        lexer = shlex.shlex(normalized, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
     except ValueError as exc:
         raise PolicyViolation(f"failed to parse command: {exc}", path=raw) from exc
 
-    if not argv:
+    if not tokens:
         raise PolicyViolation("command is empty")
 
-    return argv
+    return tokens
+
+
+def _is_unsupported_shell_token(token: str) -> bool:
+    if token in _SUPPORTED_SEQUENCE_OPERATORS or token == _SUPPORTED_PIPE_OPERATOR:
+        return False
+    punctuation = set(token)
+    if punctuation and punctuation.issubset({"&", "|", ";", ">", "<"}):
+        return True
+    return False
+
+
+def _build_command_stage(argv: list[str]) -> CommandStage:
+    if not argv:
+        raise PolicyViolation("unsupported shell syntax in command")
+    stage_argv = list(argv)
+    return CommandStage(argv=stage_argv, command=shlex.join(stage_argv))
+
+
+def command_segment_stages(segment: CommandSegment) -> list[CommandStage]:
+    stages = segment.get("stages")
+    if stages:
+        return stages
+    return [CommandStage(argv=list(segment["argv"]), command=segment["command"])]
+
+
+def parse_command_sequence(raw: str) -> list[CommandSegment]:
+    """Parse a command string into sequential command segments.
+
+    Supported separators are ``&&``, ``||``, and ``;``. Each segment may also
+    contain a pipeline joined with ``|``. Unsupported shell features such as
+    redirection, subshells, and background execution still raise
+    ``PolicyViolation``.
+    """
+    tokens = _tokenize_command(raw)
+    segments: list[CommandSegment] = []
+    argv: list[str] = []
+    stages: list[CommandStage] = []
+    next_operator: Literal["&&", "||", ";"] | None = None
+
+    def _flush_segment() -> None:
+        nonlocal argv, stages
+        stage = _build_command_stage(argv)
+        all_stages = [*stages, stage]
+        segment = CommandSegment(
+            operator=next_operator,
+            argv=all_stages[0]["argv"],
+            command=" | ".join(item["command"] for item in all_stages),
+        )
+        if len(all_stages) > 1:
+            segment["stages"] = all_stages
+        segments.append(segment)
+        argv = []
+        stages = []
+
+    for token in tokens:
+        if _is_unsupported_shell_token(token):
+            raise PolicyViolation("unsupported shell syntax in command", path=raw)
+
+        if token == _SUPPORTED_PIPE_OPERATOR:
+            stages.append(_build_command_stage(argv))
+            argv = []
+            continue
+
+        if token in _SUPPORTED_SEQUENCE_OPERATORS:
+            if not argv:
+                raise PolicyViolation("unsupported shell syntax in command", path=raw)
+            _flush_segment()
+            next_operator = cast("Literal['&&', '||', ';']", token)
+            continue
+
+        argv.append(token)
+
+    if not argv:
+        raise PolicyViolation("unsupported shell syntax in command", path=raw)
+
+    _flush_segment()
+    return segments
+
+
+def parse_command(raw: str) -> list[str]:
+    """Parse a single command argv and reject shell control syntax."""
+    segments = parse_command_sequence(raw)
+    if len(segments) != 1 or len(command_segment_stages(segments[0])) != 1:
+        raise PolicyViolation("unsupported shell syntax in command", path=raw)
+    return segments[0]["argv"]
 
 
 def _normalize_command_text(argv: list[str]) -> str:
@@ -228,6 +325,21 @@ def _matches_command_prefix(command: str, patterns: list[str] | frozenset[str]) 
         if command == normalized or command.startswith(f"{normalized} "):
             return True
     return False
+
+
+def _best_command_prefix_length(
+    command: str,
+    patterns: list[str] | frozenset[str],
+) -> int | None:
+    best: int | None = None
+    for pattern in patterns:
+        normalized = pattern.strip()
+        if not normalized:
+            continue
+        if command == normalized or command.startswith(f"{normalized} "):
+            length = len(normalized)
+            best = length if best is None else max(best, length)
+    return best
 
 
 def _unwrap_uv_run(argv: list[str]) -> list[str] | None:
@@ -563,13 +675,37 @@ def classify_command(
         if inner_risk != "high":
             return inner_risk
 
-    if _matches_command_prefix(normalized, config.command_denylist):
+    deny_match = _best_command_prefix_length(normalized, config.command_denylist)
+    approval_match = _best_command_prefix_length(normalized, config.command_approvallist)
+    allow_match = _best_command_prefix_length(normalized, config.command_allowlist)
+
+    strongest_non_deny = max(
+        length for length in (approval_match, allow_match) if length is not None
+    ) if approval_match is not None or allow_match is not None else None
+
+    if deny_match is not None and (strongest_non_deny is None or deny_match >= strongest_non_deny):
         return "high"
-    if _matches_command_prefix(normalized, config.command_approvallist):
+    if approval_match is not None and (allow_match is None or approval_match >= allow_match):
         return "medium"
-    if _matches_command_prefix(normalized, config.command_allowlist):
+    if allow_match is not None:
         return "low"
     return "high"
+
+
+def classify_command_sequence(
+    segments: list[CommandSegment],
+    config: "AgentConfig",
+) -> Literal["low", "medium", "high"]:
+    """Classify a sequential command chain using the highest segment risk."""
+    highest: Literal["low", "medium", "high"] = "low"
+    for segment in segments:
+        for stage in command_segment_stages(segment):
+            risk = classify_command(stage["argv"], config)
+            if risk == "high":
+                return "high"
+            if risk == "medium":
+                highest = "medium"
+    return highest
 
 
 def resolve_command_cwd(
@@ -624,11 +760,11 @@ def evaluate_command_call(
 ) -> Literal["allow", "deny"]:
     """Evaluate whether a run_command call should be permitted in phase 2."""
     try:
-        argv = parse_command(command)
+        segments = parse_command_sequence(command)
         resolve_command_cwd(config, cwd)
         if env is not None and not isinstance(env, Mapping):
             return "deny"
-        risk = classify_command(argv, config)
+        risk = classify_command_sequence(segments, config)
     except PolicyViolation:
         return "deny"
 

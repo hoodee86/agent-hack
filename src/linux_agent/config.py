@@ -78,6 +78,11 @@ class AgentConfig(BaseModel):
             "pwd",
             "find",
             "rg",
+            "cat",
+            "head",
+            "tail",
+            "sort",
+            "uniq",
         ]
     )
     # Explicitly denied command prefixes or executables

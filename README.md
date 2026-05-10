@@ -8,6 +8,8 @@
 
 - 只读文件系统探索：`list_dir`、`read_file`、`search_text`
 - 受控开发命令执行：`run_command`
+- 受限复合命令：支持 `&&`、`||`、`;` 和 `|`，但每个 segment / pipeline stage 都必须单独命中 allowlist
+- 通过命令 allowlist 显式放开的 `curl` 网络抓取命令
 - 受控文本写入：`apply_patch`、`write_file`（默认需要显式审批）
 - 命令执行审计、verbose 控制台明细、以及命令结果摘要
 - 命令失败后的继续诊断：可先跑 `pytest` / `mypy`，再读取相关文件继续总结
@@ -92,8 +94,11 @@ Command Summaries:
 ## 阶段 2 边界
 
 - 只支持 allowlist 内的开发命令前缀，例如 `pytest`、`mypy`、`ruff`、`git status`、`git diff`。
-- 不支持任意 shell 语法：如管道、重定向、命令替换、`&&` / `||` / 后台执行。
-- 不支持交互式命令、后台常驻进程、联网下载或安装依赖。
+- 支持受限命令链：`&&`、`||`、`;`、`|`；链内每个命令段和 pipeline stage 都会单独做策略校验。
+- 更具体的 allowlist 前缀可以覆盖更宽泛的 denylist 前缀，例如 `curl -s` 可以在保留 `curl` deny 的前提下被显式放行。
+- 不支持重定向、命令替换、后台执行、shell wrapper。
+- 不支持交互式命令、后台常驻进程、以及未显式 allowlist 的联网下载或安装依赖。
+- 若要执行 `curl`，需要在 `command_allowlist` 中显式加入对应前缀，例如 `curl -s`。
 - `cwd` 只能落在 `command_working_dirs` 声明的 workspace 子目录内。
 
 ## 阶段 3 审批写入

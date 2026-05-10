@@ -18,7 +18,8 @@
 
 - 已实现：`list_dir`、`read_file`、`search_text`、`run_command`、命令审计日志、verbose 命令明细、命令结果驱动的后续诊断。
 - 已完成的阶段 2 验收场景包括：失败测试诊断、类型检查失败总结、命令失败后的文件回读与下一步建议。
-- 当前仍不支持：任意 shell 语法、交互式命令、后台常驻进程、联网下载或安装依赖。
+- 当前支持受限命令链 `&&` / `||` / `;` / `|`，但每个命令段和 pipeline stage 都必须单独通过 allowlist / denylist 校验。
+- 当前仍不支持：重定向、命令替换、交互式命令、后台常驻进程，以及未显式 allowlist 的联网下载或安装依赖。
 - `apply_patch` / `write_file` 已接入 graph，并通过审批暂停 / 恢复链路受控执行。
 - CLI 已支持 `--resume-run <run_id> --approve|--reject` 和 `--rollback-run <run_id>`。
 - 审计日志已补充 `approval_requested`、`write_applied`、`write_rollback`。

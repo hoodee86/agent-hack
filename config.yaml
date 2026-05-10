@@ -31,6 +31,14 @@ command_allowlist:
   - pwd
   - find
   - rg
+  - curl -s
+  - cat
+  - head
+  - tail
+  - sort
+  - uniq
+  - echo
+  - wc -c
 command_denylist:
   - sudo
   - su

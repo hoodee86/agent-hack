@@ -77,7 +77,10 @@ from linux_agent.policy import (
     PolicyViolation,
     assess_tool_call,
     classify_command,
+    classify_command_sequence,
+    command_segment_stages,
     parse_command,
+    parse_command_sequence,
 )
 from linux_agent.run_store import delete_run_state, save_run_state
 from linux_agent.skills.filesystem import list_dir, read_file
@@ -189,8 +192,10 @@ All paths and working directories must stay within the workspace root.
 - Use apply_patch and write_file only when a file change is necessary to complete the goal.
 - Keep write requests narrow, text-only, and limited to the workspace.
 - Before proposing a write, gather enough evidence from read_file/search_text/list_dir to justify the exact change.
-- Never request shell control syntax such as pipes, redirection, chaining, background
-    execution, or shell wrappers.
+- Limited command chaining with &&, ||, ;, and | is allowed only when each
+    segment or pipeline stage is individually safe and allowlisted.
+- Never request redirection, background execution, command substitution,
+    or shell wrappers.
 - Call at most one tool at a time.
 - If a write tool is required, explain the intended change clearly so the approval summary is useful.
 - After any successful write, you MUST call run_command with a narrow validation command before giving a final answer.
@@ -364,7 +369,28 @@ def _command_fields_from_args(args: dict[str, object]) -> dict[str, Any]:
     if isinstance(raw_command, str) and raw_command.strip():
         payload["command"] = raw_command.strip()
         try:
-            payload["argv"] = parse_command(raw_command)
+            segments = parse_command_sequence(raw_command)
+            if len(segments) == 1 and len(command_segment_stages(segments[0])) == 1:
+                payload["argv"] = segments[0]["argv"]
+            else:
+                payload["command_segments"] = [
+                    ({
+                        "operator": segment["operator"],
+                        "command": segment["command"],
+                        "argv": segment["argv"],
+                    } if len(command_segment_stages(segment)) == 1 else {
+                        "operator": segment["operator"],
+                        "command": segment["command"],
+                        "pipeline_stages": [
+                            {
+                                "argv": stage["argv"],
+                                "command": stage["command"],
+                            }
+                            for stage in command_segment_stages(segment)
+                        ],
+                    })
+                    for segment in segments
+                ]
         except PolicyViolation:
             pass
     timeout_seconds = args.get("timeout_seconds")
@@ -381,7 +407,7 @@ def _command_fields_from_result(result: dict[str, Any] | None) -> dict[str, Any]
         return {}
 
     payload: dict[str, Any] = {}
-    for key in ("command", "argv", "cwd", "exit_code", "timed_out", "truncated"):
+    for key in ("command", "argv", "command_segments", "cwd", "exit_code", "timed_out", "truncated"):
         if key in result and result.get(key) is not None:
             payload[key] = result.get(key)
 
@@ -522,19 +548,29 @@ def _is_validation_command(result: dict[str, Any]) -> bool:
         return False
 
     try:
-        argv = [part.lower() for part in parse_command(raw_command)]
+        segments = parse_command_sequence(raw_command)
     except PolicyViolation:
         argv = [part.lower() for part in raw_command.split() if part.strip()]
+        if not argv:
+            return False
+        prefix = argv[0]
+        if prefix in _NON_VALIDATING_COMMAND_PREFIXES:
+            return False
+        joined = " ".join(argv)
+        return any(keyword in joined for keyword in _VALIDATION_COMMAND_KEYWORDS)
 
-    if not argv:
-        return False
-
-    prefix = argv[0]
-    if prefix in _NON_VALIDATING_COMMAND_PREFIXES:
-        return False
-
-    joined = " ".join(argv)
-    return any(keyword in joined for keyword in _VALIDATION_COMMAND_KEYWORDS)
+    for segment in segments:
+        for stage in command_segment_stages(segment):
+            argv = [part.lower() for part in stage["argv"]]
+            if not argv:
+                continue
+            prefix = argv[0]
+            if prefix in _NON_VALIDATING_COMMAND_PREFIXES:
+                continue
+            joined = " ".join(argv)
+            if any(keyword in joined for keyword in _VALIDATION_COMMAND_KEYWORDS):
+                return True
+    return False
 
 
 def _format_pending_verification(state: AgentState) -> str:
@@ -656,10 +692,10 @@ def _classify_tool_risk(
         return "high"
 
     try:
-        argv = parse_command(raw_command)
+        segments = parse_command_sequence(raw_command)
     except PolicyViolation:
         return "high"
-    return classify_command(argv, config)
+    return classify_command_sequence(segments, config)
 
 
 def _serialize_trace_message(message: BaseMessage) -> dict[str, Any]:

@@ -450,6 +450,13 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         )
         if data.get("argv") is not None:
             _print_field(stream, "Argv", data.get("argv"), use_color=use_color)
+        if data.get("command_segments") is not None:
+            _print_field(
+                stream,
+                "Command Segments",
+                data.get("command_segments"),
+                use_color=use_color,
+            )
         if data.get("timeout_seconds") is not None:
             _print_field(
                 stream,

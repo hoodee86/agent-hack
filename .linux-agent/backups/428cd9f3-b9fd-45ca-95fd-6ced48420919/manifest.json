@@ -1,0 +1,11 @@
+{
+  "run_id": "428cd9f3-b9fd-45ca-95fd-6ced48420919",
+  "entries": [
+    {
+      "path": "directories.txt",
+      "action": "create_only",
+      "created": true,
+      "backup_path": null
+    }
+  ]
+}

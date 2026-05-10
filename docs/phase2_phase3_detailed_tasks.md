@@ -42,7 +42,7 @@
 
 - 阶段 2 只引入 `run_command`，不引入任意写文件工具。
 - 阶段 3 先实现 `apply_patch` 作为主要写接口，再评估是否补充受限版 `write_file`。
-- 所有“安装依赖”“联网下载”“修改系统服务”类操作不属于阶段 2/3 的默认自动允许范围。
+- 所有“安装依赖”“修改系统服务”类操作不属于阶段 2/3 的默认自动允许范围；联网抓取仅在命令前缀被显式加入 allowlist 时可执行。
 
 ### 2. 保持现有 Observation 结构稳定
 
@@ -123,7 +123,7 @@ T35 阶段 3 验收与文档收口
   - `uv run pytest -q`
   - `uv run mypy src/`
   - `uv run ruff check .`
-- 默认不允许 `sudo`、`su`、`sh -c`、`bash -c`、`python -c`、重定向、管道、后台执行、任意网络访问。
+- 默认不允许 `sudo`、`su`、`sh -c`、`bash -c`、`python -c`、重定向、后台执行、任意未 allowlist 的网络访问。
 
 **验收标准**：
 
@@ -139,19 +139,21 @@ T35 阶段 3 验收与文档收口
 
 - 为 `run_command` 增加独立的命令解析逻辑，建议实现：
   - `parse_command(raw: str) -> list[str]`
+  - `parse_command_sequence(raw: str) -> list[CommandSegment]`
   - `classify_command(argv: list[str], config: AgentConfig) -> Literal["low", "medium", "high"]`
   - `evaluate_command_call(...) -> Literal["allow", "deny"]`
 - 使用 `shlex.split()` 或等价方案解析命令，并在策略层拒绝以下模式：
   - 空命令
-  - `;`、`&&`、`||`、`|`、`>`、`>>`、`<`
+  - 重定向：`>`、`>>`、`<`
   - 反引号、`$()`
   - 后台执行符号 `&`
+- 支持受限命令分隔符 `;`、`&&`、`||` 和管道 `|`，并对每个 segment / pipeline stage 分别做风险分类与 allowlist 校验。
 - 对 `cwd` 进行 workspace 边界校验，禁止命令在 workspace 外执行。
 - 对 `env` 做 allowlist 过滤，只允许显式白名单变量透传。
 - 风险分级至少区分：
   - `low`：测试、lint、类型检查、只读开发命令
   - `medium`：可能修改 workspace 产物但仍在仓库边界内的构建命令
-  - `high`：提权、删除、系统级命令、网络访问、shell 注入模式
+  - `high`：提权、删除、系统级命令、未 allowlist 的网络访问、shell 注入模式
 
 **验收标准**：
 
@@ -306,7 +308,7 @@ T35 阶段 3 验收与文档收口
   - 运行 lint / type check 并给出下一步建议
 - 更新 README 中的 verbose 样例，展示命令执行明细。
 - 在设计文档中标注阶段 2 的实现范围和已知限制，例如：
-  - 不支持任意 shell 语法
+  - 不支持任意 shell 特性；仅支持受限命令链与受限管道
   - 不支持交互式命令
   - 不支持后台常驻进程
 
