@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 
+from linux_agent.audit import EVENT_MODEL_INPUT
 from linux_agent.config import AgentConfig
 from linux_agent.graph import build_graph
 from linux_agent.state import AgentState
@@ -256,6 +257,36 @@ class TestGraphHappyPath:
         assert isinstance(prior_ai, AIMessage)
         assert len(prior_ai.tool_calls) == 1
         assert prior_ai.tool_calls[0]["id"] == "call_0_0"
+
+    def test_prompt_trace_listener_receives_per_turn_model_inputs(self, tmp_path: Path) -> None:
+        """Prompt tracing should expose the exact message sequence sent to the LLM."""
+        (tmp_path / "src.py").write_text("def main():\n    pass\n")
+        cfg = _make_config(tmp_path)
+        llm = _StubLLM(
+            turns=[
+                _tool_turn(
+                    "search_text",
+                    {"query": "def main"},
+                    content="Searching for def main",
+                ),
+                _final_turn("Found def main in src.py"),
+            ],
+            captures=[],
+        )
+        traces: list[dict[str, Any]] = []
+        app = build_graph(cfg, chat_model=llm, prompt_trace_listener=traces.append)
+
+        result = app.invoke(_initial_state("Where is main defined?", str(tmp_path)))
+
+        assert result["final_answer"] == "Found def main in src.py"
+        assert len(traces) == 2
+        assert traces[0]["event"] == EVENT_MODEL_INPUT
+        assert [message["type"] for message in traces[0]["data"]["messages"]] == [
+            "system",
+            "human",
+        ]
+        second_roles = [message["type"] for message in traces[1]["data"]["messages"]]
+        assert second_roles[-3:] == ["ai", "tool", "human"]
 
 
 class TestGraphSecurityBlocking:

@@ -23,6 +23,7 @@ Graph topology
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import time
 from typing import Any, Callable, cast
@@ -40,6 +41,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from linux_agent.audit import (
+    AuditEventListener,
+    EVENT_MODEL_INPUT,
     EVENT_PLAN_UPDATE,
     EVENT_POLICY_DECISION,
     EVENT_REFLECTOR_ACTION,
@@ -144,10 +147,30 @@ def _one_shot_audit(
     log_dir: Any,
     event: str,
     data: dict[str, Any],
+    listener: AuditEventListener | None = None,
 ) -> None:
     """Open, write one audit event, and close the JSONL logger."""
-    with AuditLogger(run_id, log_dir) as logger:
+    with AuditLogger(run_id, log_dir, listener=listener) as logger:
         logger.log(event, data)
+
+
+def _emit_runtime_event(
+    run_id: str,
+    event: str,
+    data: dict[str, Any],
+    listener: AuditEventListener | None = None,
+) -> None:
+    if listener is None:
+        return
+
+    listener(
+        {
+            "run_id": run_id,
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "event": event,
+            "data": data,
+        }
+    )
 
 
 def _serialize_tool_payload(obs: Observation, limit: int = 4000) -> str:
@@ -162,6 +185,21 @@ def _serialize_tool_payload(obs: Observation, limit: int = 4000) -> str:
     if len(text) > limit:
         return text[:limit] + " …"
     return text
+
+
+def _serialize_trace_message(message: BaseMessage) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": message.type,
+        "content": message.content,
+    }
+
+    if isinstance(message, AIMessage) and message.tool_calls:
+        payload["tool_calls"] = message.tool_calls
+
+    if isinstance(message, ToolMessage):
+        payload["tool_call_id"] = message.tool_call_id
+
+    return payload
 
 
 def _format_planner_prompt(state: AgentState, config: AgentConfig) -> str:
@@ -302,6 +340,8 @@ def _is_deepseek_model(model_name: str) -> bool:
 def _make_planner(
     config: AgentConfig,
     llm: BaseChatModel,
+    event_listener: AuditEventListener | None = None,
+    prompt_trace_listener: AuditEventListener | None = None,
 ) -> Callable[[AgentState], dict[str, Any]]:
     """Return a Planner node function closed over *config* and *llm*."""
     llm_with_tools = _bind_model_tools(llm)
@@ -310,11 +350,20 @@ def _make_planner(
         run_id = state["run_id"]
         prompt_message = HumanMessage(content=_format_planner_prompt(state, config))
         history: list[BaseMessage] = state["messages"]
-        raw = llm_with_tools.invoke(
-            [SystemMessage(content=_SYSTEM_PROMPT), *history, prompt_message]
+        request_messages = [SystemMessage(content=_SYSTEM_PROMPT), *history, prompt_message]
+        _emit_runtime_event(
+            run_id,
+            EVENT_MODEL_INPUT,
+            {
+                "message_count": len(request_messages),
+                "messages": [_serialize_trace_message(message) for message in request_messages],
+            },
+            prompt_trace_listener,
         )
+        raw = llm_with_tools.invoke(request_messages)
         response = _coerce_ai_message(raw)
         tool_call = _build_tool_call(response, state)
+        assistant_content = _content_to_text(response.content)
         current_step = _summarize_step(response, tool_call)
         plan = _append_plan_step(state["plan"], current_step)
 
@@ -325,15 +374,30 @@ def _make_planner(
             )
 
         # ── Audit ────────────────────────────────────────────────────────
-        _one_shot_audit(run_id, config.log_dir, EVENT_PLAN_UPDATE, {
-            "plan": plan,
-            "current_step": current_step,
-        })
+        _one_shot_audit(
+            run_id,
+            config.log_dir,
+            EVENT_PLAN_UPDATE,
+            {
+                "plan": plan,
+                "current_step": current_step,
+                "assistant_content": assistant_content or None,
+                "final_answer": final_answer,
+            },
+            event_listener,
+        )
         if tool_call:
-            _one_shot_audit(run_id, config.log_dir, EVENT_TOOL_PROPOSED, {
-                "tool": tool_call["name"],
-                "args": tool_call["args"],
-            })
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_TOOL_PROPOSED,
+                {
+                    "tool": tool_call["name"],
+                    "tool_call_id": tool_call["id"],
+                    "args": tool_call["args"],
+                },
+                event_listener,
+            )
 
         return {
             "messages": [prompt_message, response],
@@ -352,6 +416,7 @@ def _make_planner(
 
 def _make_policy_guard(
     config: AgentConfig,
+    event_listener: AuditEventListener | None = None,
 ) -> Callable[[AgentState], dict[str, Any]]:
     def policy_guard(state: AgentState) -> dict[str, Any]:
         tc = state["proposed_tool_call"]
@@ -361,11 +426,18 @@ def _make_policy_guard(
 
         decision = evaluate_tool_call(tc, config)
 
-        _one_shot_audit(state["run_id"], config.log_dir, EVENT_POLICY_DECISION, {
-            "tool": tc["name"],
-            "args": tc["args"],
-            "decision": decision,
-        })
+        _one_shot_audit(
+            state["run_id"],
+            config.log_dir,
+            EVENT_POLICY_DECISION,
+            {
+                "tool": tc["name"],
+                "tool_call_id": tc["id"],
+                "args": tc["args"],
+                "decision": decision,
+            },
+            event_listener,
+        )
 
         if decision == "deny":
             return {
@@ -395,6 +467,7 @@ _SKILL_DISPATCH: dict[str, Any] = {
 
 def _make_tool_executor(
     config: AgentConfig,
+    event_listener: AuditEventListener | None = None,
 ) -> Callable[[AgentState], dict[str, Any]]:
     def tool_executor(state: AgentState) -> dict[str, Any]:
         tc = state["proposed_tool_call"]
@@ -465,12 +538,20 @@ def _make_tool_executor(
                     duration_ms=duration_ms,
                 )
 
-        _one_shot_audit(state["run_id"], config.log_dir, EVENT_TOOL_RESULT, {
-            "tool": obs["tool"],
-            "ok": obs["ok"],
-            "duration_ms": obs["duration_ms"],
-            "error": obs["error"],
-        })
+        _one_shot_audit(
+            state["run_id"],
+            config.log_dir,
+            EVENT_TOOL_RESULT,
+            {
+                "tool": obs["tool"],
+                "tool_call_id": tc["id"],
+                "ok": obs["ok"],
+                "duration_ms": obs["duration_ms"],
+                "error": obs["error"],
+                "result": obs["result"],
+            },
+            event_listener,
+        )
 
         # Reset consecutive_failures on success; increment on failure
         new_failures = 0 if obs["ok"] else state["consecutive_failures"] + 1
@@ -497,6 +578,7 @@ def _make_tool_executor(
 
 def _make_reflector(
     config: AgentConfig,
+    event_listener: AuditEventListener | None = None,
 ) -> Callable[[AgentState], dict[str, Any]]:
     def reflector(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
@@ -504,10 +586,16 @@ def _make_reflector(
         # Circuit-breaker: total iteration limit
         if state["iteration_count"] >= config.max_iterations:
             summary = _fmt_observations(state["observations"], n=3)
-            _one_shot_audit(run_id, config.log_dir, EVENT_REFLECTOR_ACTION, {
-                "reason": "max_iterations",
-                "iteration_count": state["iteration_count"],
-            })
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_REFLECTOR_ACTION,
+                {
+                    "reason": "max_iterations",
+                    "iteration_count": state["iteration_count"],
+                },
+                event_listener,
+            )
             return {
                 "final_answer": (
                     f"Agent stopped: reached the maximum iteration limit "
@@ -523,11 +611,17 @@ def _make_reflector(
                 if state["observations"]
                 else "no observations"
             )
-            _one_shot_audit(run_id, config.log_dir, EVENT_REFLECTOR_ACTION, {
-                "reason": "consecutive_failures",
-                "count": state["consecutive_failures"],
-                "last_error": last_err,
-            })
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_REFLECTOR_ACTION,
+                {
+                    "reason": "consecutive_failures",
+                    "count": state["consecutive_failures"],
+                    "last_error": last_err,
+                },
+                event_listener,
+            )
             return {
                 "final_answer": (
                     f"Agent stopped: {state['consecutive_failures']} consecutive "
@@ -547,15 +641,22 @@ def _make_reflector(
 
 def _make_finalizer(
     config: AgentConfig,
+    event_listener: AuditEventListener | None = None,
 ) -> Callable[[AgentState], dict[str, Any]]:
     def finalizer(state: AgentState) -> dict[str, Any]:
         final = state.get("final_answer") or "(no answer produced)"
 
-        _one_shot_audit(state["run_id"], config.log_dir, EVENT_RUN_END, {
-            "final_answer": final,
-            "iteration_count": state["iteration_count"],
-            "observation_count": len(state["observations"]),
-        })
+        _one_shot_audit(
+            state["run_id"],
+            config.log_dir,
+            EVENT_RUN_END,
+            {
+                "final_answer": final,
+                "iteration_count": state["iteration_count"],
+                "observation_count": len(state["observations"]),
+            },
+            event_listener,
+        )
 
         return {"final_answer": final}
 
@@ -591,6 +692,8 @@ def _route_reflector(state: AgentState) -> str:
 def build_graph(
     config: AgentConfig,
     chat_model: BaseChatModel | None = None,
+    event_listener: AuditEventListener | None = None,
+    prompt_trace_listener: AuditEventListener | None = None,
 ) -> Any:
     """
     Assemble and compile the LangGraph state machine.
@@ -654,11 +757,14 @@ def build_graph(
     graph: Any = StateGraph(AgentState)
 
     # ── Register nodes ────────────────────────────────────────────────────
-    graph.add_node("planner", _make_planner(config, chat_model))
-    graph.add_node("policy_guard", _make_policy_guard(config))
-    graph.add_node("tool_executor", _make_tool_executor(config))
-    graph.add_node("reflector", _make_reflector(config))
-    graph.add_node("finalizer", _make_finalizer(config))
+    graph.add_node(
+        "planner",
+        _make_planner(config, chat_model, event_listener, prompt_trace_listener),
+    )
+    graph.add_node("policy_guard", _make_policy_guard(config, event_listener))
+    graph.add_node("tool_executor", _make_tool_executor(config, event_listener))
+    graph.add_node("reflector", _make_reflector(config, event_listener))
+    graph.add_node("finalizer", _make_finalizer(config, event_listener))
 
     # ── Entry point ───────────────────────────────────────────────────────
     graph.add_edge(START, "planner")

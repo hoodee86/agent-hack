@@ -8,6 +8,7 @@ streamed, grep-ed, or replayed without parsing the entire file.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,8 +27,12 @@ class AuditEvent(TypedDict):
     data: dict[str, Any]
 
 
+AuditEventListener = Callable[[AuditEvent], None]
+
+
 # ── canonical event type names ──────────────────────────────────────────────
 EVENT_RUN_START = "run_start"
+EVENT_MODEL_INPUT = "model_input"
 EVENT_PLAN_UPDATE = "plan_update"
 EVENT_TOOL_PROPOSED = "tool_proposed"
 EVENT_POLICY_DECISION = "policy_decision"
@@ -54,9 +59,15 @@ class AuditLogger:
             logger.log(EVENT_PLAN_UPDATE, {"plan": [...]})
     """
 
-    def __init__(self, run_id: str, log_dir: Path) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        log_dir: Path,
+        listener: AuditEventListener | None = None,
+    ) -> None:
         self._run_id = run_id
         self._log_dir = log_dir
+        self._listener = listener
         self._log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self._log_dir / f"{run_id}.jsonl"
         # Open in append mode so that resuming a run keeps history intact
@@ -76,6 +87,8 @@ class AuditLogger:
         }
         self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._fh.flush()  # ensure visibility even if the process crashes
+        if self._listener is not None:
+            self._listener(record)
 
     def close(self) -> None:
         """Flush and close the underlying file handle."""

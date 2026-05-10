@@ -18,6 +18,12 @@ uv run python -m linux_agent --config config.yaml "项目里有哪些 Python 文
 
 # 或直接传 workspace
 uv run python -m linux_agent --workspace /path/to/project "README 里说了什么"
+
+# 在 stderr 中查看分段彩色调试日志
+uv run python -m linux_agent --config config.yaml --verbose "README 里说了什么"
+
+# 额外打印每轮发给模型的 system/history/user 消息序列
+uv run python -m linux_agent --config config.yaml --verbose --show-prompts "README 里说了什么"
 ```
 
 ## 开发

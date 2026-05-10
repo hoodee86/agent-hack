@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from linux_agent.audit import EVENT_MODEL_INPUT, EVENT_PLAN_UPDATE, EVENT_TOOL_RESULT
 from linux_agent.app import main
 from linux_agent.state import AgentState
 
@@ -45,6 +46,76 @@ def _mock_graph(answer: str = "OK") -> MagicMock:
     app.invoke.return_value = _fake_final_state(answer)
     graph_mock = MagicMock(return_value=app)
     return graph_mock
+
+
+def _mock_graph_with_events(answer: str = "OK") -> MagicMock:
+    """Return a mock compiled graph that emits verbose events before returning."""
+
+    def _factory(*args: Any, **kwargs: Any) -> MagicMock:
+        event_listener = kwargs.get("event_listener")
+        prompt_trace_listener = kwargs.get("prompt_trace_listener")
+        app = MagicMock()
+
+        def _invoke(state: AgentState) -> AgentState:
+            if prompt_trace_listener is not None:
+                prompt_trace_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:00+00:00",
+                        "event": EVENT_MODEL_INPUT,
+                        "data": {
+                            "message_count": 2,
+                            "messages": [
+                                {
+                                    "type": "system",
+                                    "content": "You are a read-only Linux filesystem agent.",
+                                },
+                                {
+                                    "type": "human",
+                                    "content": "Goal: goal\n\nWorkspace root: /tmp/project",
+                                },
+                            ],
+                        },
+                    }
+                )
+            assert event_listener is not None
+            event_listener(
+                {
+                    "run_id": state["run_id"],
+                    "ts": "2026-05-10T00:00:00+00:00",
+                    "event": EVENT_PLAN_UPDATE,
+                    "data": {
+                        "plan": ["Search for main"],
+                        "current_step": "Searching for def main",
+                        "assistant_content": "I will search for def main.",
+                        "final_answer": None,
+                    },
+                }
+            )
+            event_listener(
+                {
+                    "run_id": state["run_id"],
+                    "ts": "2026-05-10T00:00:01+00:00",
+                    "event": EVENT_TOOL_RESULT,
+                    "data": {
+                        "tool": "search_text",
+                        "tool_call_id": "call_0",
+                        "ok": True,
+                        "duration_ms": 12,
+                        "error": None,
+                        "result": {
+                            "ok": True,
+                            "matches": [{"file": "src/linux_agent/app.py", "line_number": 73}],
+                        },
+                    },
+                }
+            )
+            return _fake_final_state(answer)
+
+        app.invoke.side_effect = _invoke
+        return app
+
+    return MagicMock(side_effect=_factory)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,7 +252,83 @@ class TestCLIArguments:
             code = main(["goal", "--verbose"])
         assert code == 0
         err = capsys.readouterr().err
-        assert "run_id" in err
+        assert "Run ID:" in err
+
+    def test_verbose_prints_detailed_iteration_events(self, tmp_path: Path, capsys: Any) -> None:
+        with (
+            patch("linux_agent.app.build_graph", _mock_graph_with_events("Verbose")),
+            patch(
+                "linux_agent.app.load_config",
+                return_value=MagicMock(
+                    workspace_root=tmp_path,
+                    log_dir=tmp_path / "logs",
+                    max_iterations=12,
+                    max_consecutive_failures=3,
+                    llm_model="deepseek-v4-pro",
+                    model_dump=MagicMock(
+                        return_value={
+                            "workspace_root": tmp_path,
+                            "log_dir": tmp_path / "logs",
+                            "max_iterations": 12,
+                            "max_consecutive_failures": 3,
+                            "llm_model": "deepseek-v4-pro",
+                            "llm_temperature": 0.0,
+                            "max_read_bytes": 65536,
+                            "max_search_results": 100,
+                            "max_list_entries": 200,
+                            "sensitive_path_parts": [],
+                        }
+                    ),
+                ),
+            ),
+        ):
+            code = main(["goal", "--verbose"])
+
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "[linux-agent] Run Start" in err
+        assert "[linux-agent] Iteration 1 | Planner" in err
+        assert "Searching for def main" in err
+        assert "[linux-agent] Iteration 1 | Tool Result" in err
+        assert "Tool: search_text" in err
+
+    def test_show_prompts_prints_model_input_sequence(self, tmp_path: Path, capsys: Any) -> None:
+        with (
+            patch("linux_agent.app.build_graph", _mock_graph_with_events("Verbose")),
+            patch(
+                "linux_agent.app.load_config",
+                return_value=MagicMock(
+                    workspace_root=tmp_path,
+                    log_dir=tmp_path / "logs",
+                    max_iterations=12,
+                    max_consecutive_failures=3,
+                    llm_model="deepseek-v4-pro",
+                    model_dump=MagicMock(
+                        return_value={
+                            "workspace_root": tmp_path,
+                            "log_dir": tmp_path / "logs",
+                            "max_iterations": 12,
+                            "max_consecutive_failures": 3,
+                            "llm_model": "deepseek-v4-pro",
+                            "llm_temperature": 0.0,
+                            "max_read_bytes": 65536,
+                            "max_search_results": 100,
+                            "max_list_entries": 200,
+                            "sensitive_path_parts": [],
+                        }
+                    ),
+                ),
+            ),
+        ):
+            code = main(["goal", "--show-prompts"])
+
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "[linux-agent] Iteration 1 | Model Input" in err
+        assert "Message Count: 2" in err
+        assert "[1] system" in err
+        assert "[2] human" in err
+        assert "You are a read-only Linux filesystem agent." in err
 
     def test_output_printed_to_stdout(self, tmp_path: Path, capsys: Any) -> None:
         with (
