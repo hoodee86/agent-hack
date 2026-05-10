@@ -15,9 +15,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from linux_agent.audit import (
+    EVENT_APPROVAL_PRESENTED,
+    EVENT_APPROVAL_RESPONSE,
+    EVENT_BUDGET_WARNING,
     EVENT_MODEL_INPUT,
     EVENT_PLAN_UPDATE,
     EVENT_POLICY_DECISION,
+    EVENT_REFLECTION_SCORED,
     EVENT_TOOL_PROPOSED,
     EVENT_TOOL_RESULT,
 )
@@ -136,6 +140,11 @@ def _mock_config(tmp_path: Path) -> MagicMock:
         log_dir=tmp_path / "logs",
         max_iterations=12,
         max_consecutive_failures=3,
+        max_command_count=8,
+        max_runtime_seconds=900,
+        max_plan_revisions=3,
+        max_recovery_attempts_per_issue=2,
+        approval_ui_mode="detailed",
         llm_model="deepseek-v4-pro",
         model_dump=MagicMock(
             return_value={
@@ -143,6 +152,11 @@ def _mock_config(tmp_path: Path) -> MagicMock:
                 "log_dir": tmp_path / "logs",
                 "max_iterations": 12,
                 "max_consecutive_failures": 3,
+                "max_command_count": 8,
+                "max_runtime_seconds": 900,
+                "max_plan_revisions": 3,
+                "max_recovery_attempts_per_issue": 2,
+                "approval_ui_mode": "detailed",
                 "llm_model": "deepseek-v4-pro",
                 "llm_temperature": 0.0,
                 "max_read_bytes": 65536,
@@ -266,6 +280,84 @@ class TestCLIArguments:
             main(["--resume-run", "run-1"])
         assert exc_info.value.code != 0
 
+    def test_show_pending_run_renders_approval_card(self, tmp_path: Path, capsys: Any) -> None:
+        saved_state = AgentState(
+            run_id="resume-1",
+            user_goal="Create notes.txt",
+            workspace_root=str(tmp_path),
+            messages=[],
+            plan=["Create notes.txt"],
+            plan_version=1,
+            plan_revision_count=0,
+            plan_steps=[
+                {
+                    "id": "step_1",
+                    "title": "Create notes.txt",
+                    "status": "in_progress",
+                    "rationale": None,
+                    "evidence_refs": [],
+                }
+            ],
+            current_step="Create notes.txt",
+            proposed_tool_call={
+                "id": "call_1",
+                "name": "write_file",
+                "args": {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                "risk_level": "high",
+            },
+            observations=[],
+            risk_decision="needs_approval",
+            pending_approval={
+                "id": "approval-1",
+                "tool": "write_file",
+                "args": {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                "reason": "Write operations require explicit approval before execution.",
+                "impact_summary": "This request would create workspace file 'notes.txt'.",
+                "diff_preview": "hello",
+                "backup_plan": "Backups will be written before overwrite.",
+                "affected_files": ["notes.txt"],
+                "risk_level": "high",
+                "suggested_verification_command": "uv run pytest",
+                "rollback_command": "--rollback-run resume-1",
+            },
+            resume_action=None,
+            pending_verification=None,
+            last_write=None,
+            last_verification=None,
+            last_rollback=None,
+            recovery_state={
+                "issue_type": "command_failure",
+                "fingerprint": "run_command:find missing-dir",
+                "attempt_count": 1,
+                "last_action": "Read the missing path first",
+                "can_retry": True,
+            },
+            recovery_attempt_total=1,
+            budget_status={
+                "iteration_count": 0,
+                "command_count": 0,
+                "elapsed_seconds": 3,
+                "warning_triggered": False,
+            },
+            budget_stop_reason=None,
+            iteration_count=0,
+            consecutive_failures=0,
+            final_answer="Approval required before executing tool 'write_file'.",
+        )
+
+        with (
+            patch("linux_agent.app.load_config", return_value=_mock_config(tmp_path)),
+            patch("linux_agent.app.load_run_state", return_value=saved_state),
+        ):
+            code = main(["--show-pending-run", "resume-1"])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Approval Review" in out
+        assert "Affected Files: notes.txt" in out
+        assert "Budget Remaining:" in out
+        assert "Review Again: --show-pending-run resume-1" in out
+
     def test_verbose_flag_prints_to_stderr(self, tmp_path: Path, capsys: Any) -> None:
         with (
             patch("linux_agent.app.build_graph", _mock_graph("Verbose")),
@@ -336,6 +428,139 @@ class TestCLIArguments:
         assert "Searching for def main" in err
         assert "[linux-agent] Iteration 1 | Tool Result" in err
         assert "Tool: search_text" in err
+
+    def test_verbose_prints_phase4_decision_events(self, tmp_path: Path, capsys: Any) -> None:
+        def _mock_graph_with_phase4_events(*args: Any, **kwargs: Any) -> MagicMock:
+            event_listener = kwargs.get("event_listener")
+            app = MagicMock()
+
+            def _invoke(state: AgentState) -> AgentState:
+                assert event_listener is not None
+                event_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:00+00:00",
+                        "event": EVENT_REFLECTION_SCORED,
+                        "data": {
+                            "score": 42,
+                            "outcome": "replan",
+                            "retryable": True,
+                            "reflection_reason": "The previous search produced no new information.",
+                            "recommended_next_action": "Try an alternate symbol name.",
+                            "tool": "search_text",
+                            "issue_type": "search_no_results",
+                            "recovery_attempt_count": 1,
+                            "recovery_attempt_total": 1,
+                            "budget_status": {
+                                "iteration_count": 1,
+                                "command_count": 0,
+                                "elapsed_seconds": 5,
+                                "warning_triggered": False,
+                            },
+                            "budget_pressure": 0.25,
+                            "new_information": False,
+                        },
+                    }
+                )
+                event_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:01+00:00",
+                        "event": EVENT_BUDGET_WARNING,
+                        "data": {
+                            "dimensions": ["max_runtime_seconds"],
+                            "budget_status": {
+                                "iteration_count": 1,
+                                "command_count": 0,
+                                "elapsed_seconds": 720,
+                                "warning_triggered": True,
+                            },
+                            "budget_remaining": {
+                                "iterations_remaining": 11,
+                                "commands_remaining": 8,
+                                "runtime_remaining_seconds": 180,
+                                "plan_revisions_remaining": 3,
+                                "recovery_attempts_remaining": 2,
+                            },
+                        },
+                    }
+                )
+                event_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:02+00:00",
+                        "event": EVENT_APPROVAL_PRESENTED,
+                        "data": {
+                            "approval_request_id": "approval-1",
+                            "tool": "write_file",
+                            "tool_summary": "write_file notes.txt [create_only]",
+                            "risk_level": "high",
+                            "reason": "Write operations require explicit approval before execution.",
+                            "impact_summary": "This request would create workspace file 'notes.txt'.",
+                            "affected_files": ["notes.txt"],
+                            "diff_preview": "hello",
+                            "backup_plan": "Backups will be written before overwrite.",
+                            "rollback_command": "--rollback-run run-1",
+                            "suggested_verification_command": "uv run pytest",
+                            "budget_status": {
+                                "iteration_count": 1,
+                                "command_count": 0,
+                                "elapsed_seconds": 5,
+                                "warning_triggered": False,
+                            },
+                            "budget_remaining": {
+                                "iterations_remaining": 11,
+                                "commands_remaining": 8,
+                                "runtime_remaining_seconds": 895,
+                                "plan_revisions_remaining": 3,
+                                "recovery_attempts_remaining": 2,
+                            },
+                            "recovery_state": None,
+                            "state_path": str(tmp_path / "logs" / "state" / "run-1.json"),
+                            "resume_approve_command": "--resume-run run-1 --approve",
+                            "resume_reject_command": "--resume-run run-1 --reject",
+                            "show_pending_command": "--show-pending-run run-1",
+                        },
+                    }
+                )
+                event_listener(
+                    {
+                        "run_id": state["run_id"],
+                        "ts": "2026-05-10T00:00:03+00:00",
+                        "event": EVENT_APPROVAL_RESPONSE,
+                        "data": {
+                            "approval_request_id": "approval-1",
+                            "tool": "write_file",
+                            "action": "reject",
+                            "note": "The diff is too broad.",
+                            "affected_files": ["notes.txt"],
+                        },
+                    }
+                )
+                return _fake_final_state("Phase4")
+
+            app.invoke.side_effect = _invoke
+            return app
+
+        with (
+            patch(
+                "linux_agent.app.build_graph",
+                MagicMock(side_effect=_mock_graph_with_phase4_events),
+            ),
+            patch("linux_agent.app.load_config", return_value=_mock_config(tmp_path)),
+        ):
+            code = main(["goal", "--verbose"])
+
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "[linux-agent] Iteration 0 | Reflection" in err or "[linux-agent] Iteration 1 | Reflection" in err
+        assert "Score: 42" in err
+        assert "Outcome: replan" in err
+        assert "[linux-agent] Iteration 0 | Budget Warning" in err or "[linux-agent] Iteration 1 | Budget Warning" in err
+        assert "[linux-agent] Iteration 0 | Approval Presented" in err or "[linux-agent] Iteration 1 | Approval Presented" in err
+        assert "Rollback Command: --rollback-run run-1" in err
+        assert "Approval Response" in err
+        assert "Note:" in err
 
     def test_show_prompts_prints_model_input_sequence(self, tmp_path: Path, capsys: Any) -> None:
         with (
@@ -631,7 +856,66 @@ class TestCLIArguments:
         assert code == 0
         assert captured_state["resume_action"] == "approve"
         assert captured_state["user_goal"] == "Create notes.txt"
+        assert captured_state["approval_response_note"] is None
         assert "Write completed." in capsys.readouterr().out
+
+    def test_resume_run_reject_passes_decision_note(self, tmp_path: Path, capsys: Any) -> None:
+        saved_state = AgentState(
+            run_id="resume-1",
+            user_goal="Create notes.txt",
+            workspace_root=str(tmp_path),
+            messages=[],
+            plan=["Create notes.txt"],
+            current_step="Create notes.txt",
+            proposed_tool_call={
+                "id": "call_1",
+                "name": "write_file",
+                "args": {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                "risk_level": "high",
+            },
+            observations=[],
+            risk_decision="needs_approval",
+            pending_approval={
+                "id": "approval-1",
+                "tool": "write_file",
+                "args": {"path": "notes.txt", "content": "hello\n", "mode": "create_only"},
+                "reason": "Write operations require explicit approval before execution.",
+                "impact_summary": "This request would create workspace file 'notes.txt'.",
+                "diff_preview": "hello",
+                "backup_plan": "Backups will be written before overwrite.",
+            },
+            resume_action=None,
+            pending_verification=None,
+            last_write=None,
+            last_verification=None,
+            last_rollback=None,
+            iteration_count=0,
+            consecutive_failures=0,
+            final_answer="Approval required before executing tool 'write_file'.",
+        )
+
+        captured_state: dict[str, Any] = {}
+
+        def _build_graph(*args: Any, **kwargs: Any) -> MagicMock:
+            app = MagicMock()
+
+            def _invoke(state: AgentState) -> AgentState:
+                captured_state.update(state)
+                return _fake_final_state("Rejected.")
+
+            app.invoke.side_effect = _invoke
+            return app
+
+        with (
+            patch("linux_agent.app.build_graph", MagicMock(side_effect=_build_graph)),
+            patch("linux_agent.app.load_config", return_value=_mock_config(tmp_path)),
+            patch("linux_agent.app.load_run_state", return_value=saved_state),
+        ):
+            code = main(["--resume-run", "resume-1", "--reject", "--decision-note", "diff too broad"])
+
+        assert code == 0
+        assert captured_state["resume_action"] == "reject"
+        assert captured_state["approval_response_note"] == "diff too broad"
 
     def test_rollback_run_calls_helper(self, tmp_path: Path, capsys: Any) -> None:
         with (

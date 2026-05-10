@@ -16,7 +16,9 @@
 - T38 已完成。
 - T39 已完成。
 - T40 已完成。
-- T41-T44 未开始。
+- T41 已完成。
+- T42 已完成。
+- T43-T44 未开始。
 
 本文默认遵循以下原则：
 
@@ -315,7 +317,7 @@ class BudgetStatus(TypedDict):
 - Planner prompt 已显示剩余预算；run_end 审计事件已包含 `budget_status`、`budget_remaining`、`budget_stop_reason`。
 - CLI verbose 已显示预算快照、剩余预算和预算停止原因；新增测试覆盖命令预算熔断、运行时预算熔断和 verbose 渲染。
 
-### T41 — 审批交互模型与 CLI UI 增强
+### T41 — 审批交互模型与 CLI UI 增强 已完成
 
 **文件**：`src/linux_agent/app.py`、必要时新增 `src/linux_agent/approval_ui.py`、`src/linux_agent/run_store.py`
 
@@ -347,7 +349,14 @@ class BudgetStatus(TypedDict):
 - 审批展示 payload 可被未来 API / UI 复用，而不是硬编码在 stderr 文案里。
 - 恢复和拒绝操作都可带结构化说明并进入 audit。
 
-### T42 — 审计与 verbose 可观测性扩展
+**实现结果（2026-05-10）**：
+
+- 新增 `src/linux_agent/approval_ui.py`，将审批展示抽象成可复用 `approval view` 载荷，统一包含工具摘要、影响文件、diff 预览、备份/回滚命令、建议验证命令、预算剩余、恢复状态、计划步骤与恢复命令。
+- `app.py` 已新增 `--show-pending-run <run_id>`，可在不恢复执行的情况下重新查看待审批 run 的完整审批卡片；暂停时 CLI 也会直接打印同一套审批视图。
+- `--resume-run ... --approve/--reject` 现已支持 `--decision-note "..."`，批准备注或拒绝原因会通过 graph 传入审批恢复链路并在拒绝场景同步到最终回答。
+- `policy.py` 生成的 `ApprovalRequest` 已补充 `affected_files`、`risk_level`、`suggested_verification_command`、`rollback_command`，为未来 HTTP / Web UI 复用保留了稳定字段。
+
+### T42 — 审计与 verbose 可观测性扩展 已完成
 
 **文件**：`src/linux_agent/audit.py`、`src/linux_agent/app.py`、`src/linux_agent/graph.py`
 
@@ -379,6 +388,13 @@ class BudgetStatus(TypedDict):
 - 阶段 4 的关键决策链路可以在 JSONL 中完整回放。
 - `--verbose` 下，用户能看清“为什么继续/为什么停止/为什么重规划”。
 - 日志字段足以支持未来阶段的 run replay 或简单可视化。
+
+**实现结果（2026-05-10）**：
+
+- `audit.py` 已新增 `plan_revised`、`reflection_scored`、`recovery_attempted`、`recovery_exhausted`、`recovery_cleared`、`budget_warning`、`budget_exhausted`、`approval_presented`、`approval_response` 等阶段 4 独立事件；同时保留原有 `reflector_action` 作为兼容层。
+- `graph.py` 已在 planner / approval_pause / resume_gate / reflector 中实际发出上述事件，并为 `approval_presented` 写入完整审批视图，为 `approval_response` 写入用户动作与备注。
+- `run_end` 已补充 `runtime_seconds`、`recovery_attempt_total`、`budget_usage`、`budget_stop_reason`、`last_reflection`、`recovery_state` 等字段，阶段 4 的关键决策链路现在可直接从 JSONL 回放。
+- `app.py` verbose printer 已支持独立渲染计划修订、反思评分、恢复尝试、预算警告/耗尽、审批展示与审批响应，控制台可直接看到 reflection score、outcome、剩余预算与恢复指纹/次数。
 
 ### T43 — 阶段 4 单元测试、集成测试、安全回归
 

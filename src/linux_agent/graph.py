@@ -48,12 +48,22 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
+from linux_agent.approval_ui import build_approval_view
 from linux_agent.audit import (
     AuditEventListener,
+    EVENT_APPROVAL_PRESENTED,
     EVENT_APPROVAL_REQUESTED,
+    EVENT_APPROVAL_RESPONSE,
+    EVENT_BUDGET_EXHAUSTED,
+    EVENT_BUDGET_WARNING,
     EVENT_MODEL_INPUT,
     EVENT_PLAN_UPDATE,
+    EVENT_PLAN_REVISED,
     EVENT_POLICY_DECISION,
+    EVENT_RECOVERY_ATTEMPTED,
+    EVENT_RECOVERY_CLEARED,
+    EVENT_RECOVERY_EXHAUSTED,
+    EVENT_REFLECTION_SCORED,
     EVENT_REFLECTOR_ACTION,
     EVENT_RUN_END,
     EVENT_TOOL_PROPOSED,
@@ -238,6 +248,23 @@ def _one_shot_audit(
     """Open, write one audit event, and close the JSONL logger."""
     with AuditLogger(run_id, log_dir, listener=listener) as logger:
         logger.log(event, data)
+
+
+def _audit_with_legacy_reflector(
+    run_id: str,
+    log_dir: Any,
+    event: str,
+    data: dict[str, Any],
+    listener: AuditEventListener | None = None,
+    *,
+    legacy_reason: str | None = None,
+) -> None:
+    _one_shot_audit(run_id, log_dir, event, data, listener)
+    if legacy_reason is None:
+        return
+    legacy_payload = dict(data)
+    legacy_payload.setdefault("reason", legacy_reason)
+    _one_shot_audit(run_id, log_dir, EVENT_REFLECTOR_ACTION, legacy_payload, listener)
 
 
 def _emit_runtime_event(
@@ -1035,6 +1062,13 @@ def _current_recovery_attempt_count(state: AgentState) -> int:
     return 0
 
 
+def _effective_recovery_attempt_total(state: AgentState) -> int:
+    raw_total = state.get("recovery_attempt_total")
+    if isinstance(raw_total, int) and raw_total >= 0:
+        return raw_total
+    return 0
+
+
 def _budget_status_snapshot(
     state: AgentState,
     *,
@@ -1770,10 +1804,10 @@ def _make_planner(
                 plan_revision_count=plan_revision_count,
                 recovery_attempt_count=recovery_attempt_count,
             )
-            _one_shot_audit(
+            _audit_with_legacy_reflector(
                 run_id,
                 config.log_dir,
-                EVENT_REFLECTOR_ACTION,
+                EVENT_BUDGET_EXHAUSTED,
                 {
                     "reason": "budget_exhausted",
                     "budget_stop_reason": "max_runtime_seconds",
@@ -1786,6 +1820,7 @@ def _make_planner(
                     ),
                 },
                 event_listener,
+                legacy_reason="budget_exhausted",
             )
             return {
                 "started_at": started_at,
@@ -1855,10 +1890,10 @@ def _make_planner(
                 command_count=command_count,
                 warning_triggered=True,
             )
-            _one_shot_audit(
+            _audit_with_legacy_reflector(
                 run_id,
                 config.log_dir,
-                EVENT_REFLECTOR_ACTION,
+                EVENT_BUDGET_WARNING,
                 {
                     "reason": "budget_warning",
                     "dimensions": warning_dimensions,
@@ -1871,6 +1906,7 @@ def _make_planner(
                     ),
                 },
                 event_listener,
+                legacy_reason="budget_warning",
             )
 
         if budget_stop_reason is not None:
@@ -1884,10 +1920,10 @@ def _make_planner(
                 plan_revision_count=int(plan_update["plan_revision_count"]),
                 recovery_attempt_count=recovery_attempt_count,
             )
-            _one_shot_audit(
+            _audit_with_legacy_reflector(
                 run_id,
                 config.log_dir,
-                EVENT_REFLECTOR_ACTION,
+                EVENT_BUDGET_EXHAUSTED,
                 {
                     "reason": "budget_exhausted",
                     "budget_stop_reason": budget_stop_reason,
@@ -1902,6 +1938,7 @@ def _make_planner(
                     ),
                 },
                 event_listener,
+                legacy_reason="budget_exhausted",
             )
 
         updated_recovery_state = state.get("recovery_state")
@@ -1943,6 +1980,28 @@ def _make_planner(
             },
             event_listener,
         )
+        if plan_update["plan_revision_reason"] is not None:
+            _one_shot_audit(
+                run_id,
+                config.log_dir,
+                EVENT_PLAN_REVISED,
+                {
+                    "plan": plan_update["plan"],
+                    "current_step": plan_update["current_step"],
+                    "plan_steps": plan_update["plan_steps"],
+                    "plan_version": plan_update["plan_version"],
+                    "plan_revision_count": plan_update["plan_revision_count"],
+                    "plan_revision_reason": plan_update["plan_revision_reason"],
+                    "budget_status": budget_status,
+                    "budget_remaining": _budget_remaining(
+                        config,
+                        budget_status,
+                        plan_revision_count=int(plan_update["plan_revision_count"]),
+                        recovery_attempt_count=recovery_attempt_count,
+                    ),
+                },
+                event_listener,
+            )
         if tool_call:
             _one_shot_audit(
                 run_id,
@@ -1963,6 +2022,7 @@ def _make_planner(
             "command_count": command_count,
             "budget_status": budget_status,
             "budget_stop_reason": budget_stop_reason,
+            "recovery_attempt_total": _effective_recovery_attempt_total(state),
             "recovery_state": updated_recovery_state,
             "proposed_tool_call": None if budget_stop_reason is not None else tool_call,
             "final_answer": final_answer,
@@ -2000,6 +2060,9 @@ def _make_policy_guard(
             audit_payload["impact_summary"] = approval_request["impact_summary"]
             audit_payload["diff_preview"] = approval_request["diff_preview"]
             audit_payload["backup_plan"] = approval_request["backup_plan"]
+            audit_payload["affected_files"] = approval_request.get("affected_files")
+            audit_payload["rollback_command"] = approval_request.get("rollback_command")
+            audit_payload["suggested_verification_command"] = approval_request.get("suggested_verification_command")
 
         _one_shot_audit(
             state["run_id"],
@@ -2051,6 +2114,7 @@ def _make_approval_pause(
             return {}
 
         snapshot_path = save_run_state(state, config)
+        approval_view = build_approval_view(state, config, state_path=snapshot_path)
         _one_shot_audit(
             state["run_id"],
             config.log_dir,
@@ -2068,25 +2132,41 @@ def _make_approval_pause(
             },
             event_listener,
         )
+        _one_shot_audit(
+            state["run_id"],
+            config.log_dir,
+            EVENT_APPROVAL_PRESENTED,
+            {
+                **approval_view,
+                "source": "approval_pause",
+            },
+            event_listener,
+        )
 
         message = state.get("final_answer") or (
             f"Approval required before executing tool '{tool_call['name']}'."
         )
         message = (
             f"{message}\n\n"
+            f"Review with: --show-pending-run {state['run_id']}\n"
             f"Resume with: --resume-run {state['run_id']} --approve\n"
-            f"Reject with: --resume-run {state['run_id']} --reject"
+            f"Reject with: --resume-run {state['run_id']} --reject\n"
+            "Use --decision-note \"...\" to record why you approved or rejected."
         )
         return {"final_answer": message}
 
     return approval_pause
 
 
-def _make_resume_gate(config: AgentConfig) -> Callable[[AgentState], dict[str, Any]]:
+def _make_resume_gate(
+    config: AgentConfig,
+    event_listener: AuditEventListener | None = None,
+) -> Callable[[AgentState], dict[str, Any]]:
     def resume_gate(state: AgentState) -> dict[str, Any]:
         action = state.get("resume_action")
         approval_request = state.get("pending_approval")
         tool_call = state.get("proposed_tool_call")
+        response_note = cast(str | None, state.get("approval_response_note"))
 
         if action not in {"approve", "reject"}:
             return {
@@ -2097,19 +2177,37 @@ def _make_resume_gate(config: AgentConfig) -> Callable[[AgentState], dict[str, A
             delete_run_state(state["run_id"], config)
             return {
                 "resume_action": None,
+                "approval_response_note": None,
                 "final_answer": "No pending approval request was found for this run.",
             }
 
+        _one_shot_audit(
+            state["run_id"],
+            config.log_dir,
+            EVENT_APPROVAL_RESPONSE,
+            {
+                "approval_request_id": approval_request["id"],
+                "tool": approval_request["tool"],
+                "action": action,
+                "note": response_note,
+                "affected_files": approval_request.get("affected_files"),
+                "source": "resume_gate",
+            },
+            event_listener,
+        )
         delete_run_state(state["run_id"], config)
         if action == "approve":
             return {
                 "resume_action": None,
+                "approval_response_note": None,
                 "risk_decision": "allow",
                 "final_answer": None,
             }
 
+        note_suffix = "" if not response_note else f" Reviewer note: {response_note}"
         return {
             "resume_action": None,
+            "approval_response_note": None,
             "risk_decision": "deny",
             "pending_approval": None,
             "proposed_tool_call": None,
@@ -2117,6 +2215,7 @@ def _make_resume_gate(config: AgentConfig) -> Callable[[AgentState], dict[str, A
                 f"User rejected approval request '{approval_request['id']}' for tool "
                 f"'{tool_call['name']}'. No changes were applied. "
                 "Inspect additional context and propose a narrower manual change if needed."
+                f"{note_suffix}"
             ),
         }
 
@@ -2331,6 +2430,7 @@ def _make_reflector(
         budget_status = _budget_status_snapshot(state)
         plan_revision_count = _effective_plan_revision_count(state)
         recovery_attempt_count = _current_recovery_attempt_count(state)
+        recovery_attempt_total = _effective_recovery_attempt_total(state)
         reflection_result: dict[str, Any] | None = None
         next_recovery_state: dict[str, Any] | None = cast(
             dict[str, Any] | None,
@@ -2339,10 +2439,10 @@ def _make_reflector(
 
         # Circuit-breaker: total iteration limit
         if state["iteration_count"] >= config.max_iterations:
-            _one_shot_audit(
+            _audit_with_legacy_reflector(
                 run_id,
                 config.log_dir,
-                EVENT_REFLECTOR_ACTION,
+                EVENT_BUDGET_EXHAUSTED,
                 {
                     "reason": "budget_exhausted",
                     "budget_stop_reason": "max_iterations",
@@ -2356,6 +2456,7 @@ def _make_reflector(
                     ),
                 },
                 event_listener,
+                legacy_reason="budget_exhausted",
             )
             return {
                 "budget_status": budget_status,
@@ -2371,10 +2472,10 @@ def _make_reflector(
             }
 
         if budget_status["elapsed_seconds"] >= config.max_runtime_seconds:
-            _one_shot_audit(
+            _audit_with_legacy_reflector(
                 run_id,
                 config.log_dir,
-                EVENT_REFLECTOR_ACTION,
+                EVENT_BUDGET_EXHAUSTED,
                 {
                     "reason": "budget_exhausted",
                     "budget_stop_reason": "max_runtime_seconds",
@@ -2387,6 +2488,7 @@ def _make_reflector(
                     ),
                 },
                 event_listener,
+                legacy_reason="budget_exhausted",
             )
             return {
                 "budget_status": budget_status,
@@ -2402,10 +2504,10 @@ def _make_reflector(
             }
 
         if recovery_attempt_count > config.max_recovery_attempts_per_issue:
-            _one_shot_audit(
+            _audit_with_legacy_reflector(
                 run_id,
                 config.log_dir,
-                EVENT_REFLECTOR_ACTION,
+                EVENT_BUDGET_EXHAUSTED,
                 {
                     "reason": "budget_exhausted",
                     "budget_stop_reason": "max_recovery_attempts",
@@ -2418,6 +2520,7 @@ def _make_reflector(
                     ),
                 },
                 event_listener,
+                legacy_reason="budget_exhausted",
             )
             return {
                 "budget_status": budget_status,
@@ -2449,12 +2552,16 @@ def _make_reflector(
                 if isinstance(next_recovery_state, dict)
                 else 0
             )
-            _one_shot_audit(
+            next_recovery_attempt_total = (
+                recovery_attempt_total + 1
+                if isinstance(next_recovery_state, dict)
+                else recovery_attempt_total
+            )
+            _audit_with_legacy_reflector(
                 run_id,
                 config.log_dir,
-                EVENT_REFLECTOR_ACTION,
+                EVENT_REFLECTION_SCORED,
                 {
-                    "reason": "reflection_scored",
                     "score": reflection_result["score"],
                     "outcome": reflection_result["outcome"],
                     "retryable": reflection_result["retryable"],
@@ -2463,6 +2570,7 @@ def _make_reflector(
                     "tool": last_obs["tool"],
                     "issue_type": None if issue is None else issue["issue_type"],
                     "recovery_attempt_count": next_recovery_attempt_count,
+                    "recovery_attempt_total": next_recovery_attempt_total,
                     "budget_status": budget_status,
                     "budget_pressure": _budget_pressure(
                         config,
@@ -2473,44 +2581,50 @@ def _make_reflector(
                     "new_information": _observation_produced_new_information(last_obs),
                 },
                 event_listener,
+                legacy_reason="reflection_scored",
             )
             if isinstance(next_recovery_state, dict):
-                _one_shot_audit(
+                _audit_with_legacy_reflector(
                     run_id,
                     config.log_dir,
-                    EVENT_REFLECTOR_ACTION,
+                    EVENT_RECOVERY_ATTEMPTED,
                     {
-                        "reason": "recovery_attempted",
                         **next_recovery_state,
+                        "recovery_attempt_total": next_recovery_attempt_total,
                         "recommended_next_action": reflection_result["recommended_next_action"],
                     },
                     event_listener,
+                    legacy_reason="recovery_attempted",
                 )
                 if not bool(next_recovery_state.get("can_retry", False)):
-                    _one_shot_audit(
+                    _audit_with_legacy_reflector(
                         run_id,
                         config.log_dir,
-                        EVENT_REFLECTOR_ACTION,
+                        EVENT_RECOVERY_EXHAUSTED,
                         {
-                            "reason": "recovery_exhausted",
                             **next_recovery_state,
+                            "recovery_attempt_total": next_recovery_attempt_total,
                             "recommended_next_action": reflection_result["recommended_next_action"],
                         },
                         event_listener,
+                        legacy_reason="recovery_exhausted",
                     )
             elif isinstance(state.get("recovery_state"), dict):
                 previous_recovery_state = cast(dict[str, Any], state["recovery_state"])
-                _one_shot_audit(
+                _audit_with_legacy_reflector(
                     run_id,
                     config.log_dir,
-                    EVENT_REFLECTOR_ACTION,
+                    EVENT_RECOVERY_CLEARED,
                     {
-                        "reason": "recovery_cleared",
                         "issue_type": previous_recovery_state.get("issue_type"),
                         "fingerprint": previous_recovery_state.get("fingerprint"),
+                        "recovery_attempt_total": recovery_attempt_total,
                     },
                     event_listener,
+                    legacy_reason="recovery_cleared",
                 )
+            else:
+                next_recovery_attempt_total = recovery_attempt_total
 
             command_reflection = _command_reflection_payload(last_obs)
             if command_reflection is not None:
@@ -2530,6 +2644,7 @@ def _make_reflector(
                     return {
                         "last_reflection": reflection_result,
                         "recovery_state": next_recovery_state,
+                        "recovery_attempt_total": next_recovery_attempt_total,
                         "final_answer": _build_command_timeout_answer(last_obs),
                     }
 
@@ -2575,6 +2690,7 @@ def _make_reflector(
                             "last_rollback": None,
                             "last_reflection": reflection_result,
                             "recovery_state": next_recovery_state,
+                            "recovery_attempt_total": next_recovery_attempt_total,
                         }
 
                     rollback_summary: RollbackSummary | None = None
@@ -2623,6 +2739,7 @@ def _make_reflector(
                         "last_rollback": rollback_summary,
                         "last_reflection": reflection_result,
                         "recovery_state": next_recovery_state,
+                        "recovery_attempt_total": next_recovery_attempt_total,
                     }
                     if rollback_summary is not None:
                         state_update["final_answer"] = _build_validation_failure_answer(
@@ -2651,6 +2768,7 @@ def _make_reflector(
             state_update: dict[str, Any] = {
                 "last_reflection": reflection_result,
                 "recovery_state": next_recovery_state,
+                "recovery_attempt_total": next_recovery_attempt_total,
             }
             if isinstance(next_recovery_state, dict) and not bool(next_recovery_state.get("can_retry", False)):
                 state_update.update(
@@ -2695,6 +2813,7 @@ def _make_reflector(
             return {
                 "last_reflection": reflection_result,
                 "recovery_state": next_recovery_state,
+                "recovery_attempt_total": next_recovery_attempt_total,
                 "final_answer": (
                     f"Agent stopped: {state['consecutive_failures']} consecutive "
                     f"tool failures.\nLast error: {last_err}"
@@ -2705,6 +2824,11 @@ def _make_reflector(
         return {
             "last_reflection": reflection_result,
             "recovery_state": next_recovery_state,
+            "recovery_attempt_total": (
+                next_recovery_attempt_total
+                if last_obs is not None
+                else recovery_attempt_total
+            ),
         }
 
     return reflector
@@ -2730,6 +2854,7 @@ def _make_finalizer(
         plan_steps = _effective_plan_steps(state)
         plan_revision_count = _effective_plan_revision_count(state)
         recovery_attempt_count = _current_recovery_attempt_count(state)
+        recovery_attempt_total = _effective_recovery_attempt_total(state)
         budget_status = _budget_status_snapshot(state)
         budget_remaining = _budget_remaining(
             config,
@@ -2858,9 +2983,23 @@ def _make_finalizer(
                 "plan_steps": plan_steps,
                 "budget_status": budget_status,
                 "budget_remaining": budget_remaining,
+                "budget_usage": {
+                    "iterations_used": budget_status["iteration_count"],
+                    "iteration_limit": config.max_iterations,
+                    "commands_used": budget_status["command_count"],
+                    "command_limit": config.max_command_count,
+                    "runtime_seconds": budget_status["elapsed_seconds"],
+                    "runtime_limit_seconds": config.max_runtime_seconds,
+                    "plan_revisions_used": plan_revision_count,
+                    "plan_revision_limit": config.max_plan_revisions,
+                    "recovery_attempts_used": recovery_attempt_total,
+                    "recovery_attempt_limit_per_issue": config.max_recovery_attempts_per_issue,
+                },
                 "budget_stop_reason": budget_stop_reason,
+                "runtime_seconds": budget_status["elapsed_seconds"],
                 "last_reflection": last_reflection,
                 "recovery_state": recovery_state,
+                "recovery_attempt_total": recovery_attempt_total,
                 "verification_status": (
                     None
                     if last_verification is None
@@ -3005,7 +3144,7 @@ def build_graph(
         "planner",
         _make_planner(config, chat_model, event_listener, prompt_trace_listener),
     )
-    graph.add_node("resume_gate", _make_resume_gate(config))
+    graph.add_node("resume_gate", _make_resume_gate(config, event_listener))
     graph.add_node("policy_guard", _make_policy_guard(config, event_listener))
     graph.add_node("approval_pause", _make_approval_pause(config, event_listener))
     graph.add_node("tool_executor", _make_tool_executor(config, event_listener))

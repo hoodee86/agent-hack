@@ -140,14 +140,15 @@ class TestReflectionScoring:
         assert result["recovery_state"]["attempt_count"] == 1
         assert result["recovery_state"]["can_retry"] is True
         assert any(
-            event["event"] == "reflector_action"
-            and event["data"].get("reason") == "reflection_scored"
+            event["event"] == "reflection_scored"
             and event["data"].get("outcome") == "retry"
             for event in events
         )
+        assert any(event["event"] == "recovery_attempted" for event in events)
         run_end = next(event for event in reversed(events) if event["event"] == "run_end")
         assert run_end["data"]["last_reflection"]["outcome"] == "retry"
         assert run_end["data"]["recovery_state"]["issue_type"] == "command_failure"
+        assert run_end["data"]["recovery_attempt_total"] == 1
 
     def test_search_no_results_causes_replan_reflection(self, tmp_path: Path) -> None:
         cfg = _make_config(tmp_path, log_dir=tmp_path.parent / f"{tmp_path.name}-logs")
@@ -199,8 +200,7 @@ class TestBoundedRecovery:
         assert result["recovery_state"]["can_retry"] is False
         assert "recovery budget exhausted" in (result["final_answer"] or "").lower()
         assert any(
-            event["event"] == "reflector_action"
-            and event["data"].get("reason") == "recovery_exhausted"
+            event["event"] == "recovery_exhausted"
             for event in events
         )
 
@@ -233,7 +233,6 @@ class TestBoundedRecovery:
         assert result["last_reflection"] is not None
         assert result["last_reflection"]["outcome"] == "continue"
         assert any(
-            event["event"] == "reflector_action"
-            and event["data"].get("reason") == "recovery_cleared"
+            event["event"] == "recovery_cleared"
             for event in events
         )

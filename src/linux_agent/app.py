@@ -36,14 +36,24 @@ import uuid
 from pathlib import Path
 from typing import Any, TextIO
 
+from linux_agent.approval_ui import build_approval_view, format_approval_view
 from linux_agent.audit import (
     AuditEvent,
     AuditEventListener,
     AuditLogger,
+    EVENT_APPROVAL_PRESENTED,
     EVENT_APPROVAL_REQUESTED,
+    EVENT_APPROVAL_RESPONSE,
+    EVENT_BUDGET_EXHAUSTED,
+    EVENT_BUDGET_WARNING,
     EVENT_MODEL_INPUT,
     EVENT_PLAN_UPDATE,
+    EVENT_PLAN_REVISED,
     EVENT_POLICY_DECISION,
+    EVENT_RECOVERY_ATTEMPTED,
+    EVENT_RECOVERY_CLEARED,
+    EVENT_RECOVERY_EXHAUSTED,
+    EVENT_REFLECTION_SCORED,
     EVENT_REFLECTOR_ACTION,
     EVENT_RUN_END,
     EVENT_RUN_START,
@@ -54,7 +64,7 @@ from linux_agent.audit import (
 )
 from linux_agent.config import AgentConfig, load_config
 from linux_agent.graph import build_graph
-from linux_agent.run_store import load_run_state
+from linux_agent.run_store import load_run_state, state_path
 from linux_agent.skills.write import rollback_run
 from linux_agent.state import AgentState
 
@@ -87,6 +97,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Rollback write changes recorded for a prior run id using its backup manifest.",
     )
+    action_group.add_argument(
+        "--show-pending-run",
+        metavar="RUN_ID",
+        default=None,
+        help="Render the current approval details for a paused run without resuming it.",
+    )
     decision_group = parser.add_mutually_exclusive_group()
     decision_group.add_argument(
         "--approve",
@@ -99,6 +115,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Reject the pending write request for --resume-run.",
+    )
+    parser.add_argument(
+        "--decision-note",
+        metavar="TEXT",
+        default=None,
+        help="Optional reviewer note stored with --resume-run approvals or rejections.",
     )
     parser.add_argument(
         "--config",
@@ -232,6 +254,18 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
     use_color = _supports_color(stream)
     counters = {"iteration": 0}
 
+    def _inferred_iteration(record: AuditEvent) -> int | None:
+        data = record["data"]
+        raw_iteration = data.get("iteration_count")
+        if isinstance(raw_iteration, int) and raw_iteration > 0:
+            return raw_iteration
+        budget_status = data.get("budget_status")
+        if isinstance(budget_status, dict):
+            budget_iteration = budget_status.get("iteration_count")
+            if isinstance(budget_iteration, int) and budget_iteration > 0:
+                return budget_iteration
+        return None
+
     def _iteration_for(record: AuditEvent) -> int | None:
         event = record["event"]
         if event == EVENT_MODEL_INPUT:
@@ -239,16 +273,29 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         if event == EVENT_PLAN_UPDATE:
             counters["iteration"] += 1
             return counters["iteration"]
-        if counters["iteration"] and event in {
+        if event in {
             EVENT_TOOL_PROPOSED,
             EVENT_POLICY_DECISION,
             EVENT_APPROVAL_REQUESTED,
+            EVENT_APPROVAL_PRESENTED,
+            EVENT_APPROVAL_RESPONSE,
             EVENT_TOOL_RESULT,
             EVENT_WRITE_APPLIED,
             EVENT_WRITE_ROLLBACK,
+            EVENT_PLAN_REVISED,
+            EVENT_REFLECTION_SCORED,
+            EVENT_RECOVERY_ATTEMPTED,
+            EVENT_RECOVERY_EXHAUSTED,
+            EVENT_RECOVERY_CLEARED,
+            EVENT_BUDGET_WARNING,
+            EVENT_BUDGET_EXHAUSTED,
             EVENT_REFLECTOR_ACTION,
         }:
-            return counters["iteration"]
+            inferred = _inferred_iteration(record)
+            if inferred is not None:
+                return inferred
+            if counters["iteration"]:
+                return counters["iteration"]
         return None
 
     def _title(record: AuditEvent, iteration: int | None) -> str:
@@ -271,6 +318,14 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                 if iteration is not None
                 else "Approval Requested"
             )
+        if event == EVENT_APPROVAL_PRESENTED:
+            return (
+                f"Iteration {iteration} | Approval Presented"
+                if iteration is not None
+                else "Approval Presented"
+            )
+        if event == EVENT_APPROVAL_RESPONSE:
+            return "Approval Response"
         if event == EVENT_TOOL_RESULT:
             return f"Iteration {iteration} | Tool Result"
         if event == EVENT_WRITE_APPLIED:
@@ -287,6 +342,20 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             )
         if event == EVENT_REFLECTOR_ACTION:
             return f"Iteration {iteration} | Reflector"
+        if event == EVENT_PLAN_REVISED:
+            return f"Iteration {iteration} | Plan Revised"
+        if event == EVENT_REFLECTION_SCORED:
+            return f"Iteration {iteration} | Reflection"
+        if event == EVENT_RECOVERY_ATTEMPTED:
+            return f"Iteration {iteration} | Recovery Attempted"
+        if event == EVENT_RECOVERY_EXHAUSTED:
+            return f"Iteration {iteration} | Recovery Exhausted"
+        if event == EVENT_RECOVERY_CLEARED:
+            return f"Iteration {iteration} | Recovery Cleared"
+        if event == EVENT_BUDGET_WARNING:
+            return f"Iteration {iteration} | Budget Warning"
+        if event == EVENT_BUDGET_EXHAUSTED:
+            return f"Iteration {iteration} | Budget Exhausted"
         return record["event"].replace("_", " ").title()
 
     def _color(record: AuditEvent) -> str:
@@ -308,12 +377,35 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             return _Ansi.GREEN if record["data"].get("ok") else _Ansi.RED
         if event == EVENT_APPROVAL_REQUESTED:
             return _Ansi.YELLOW
+        if event == EVENT_APPROVAL_PRESENTED:
+            return _Ansi.YELLOW
+        if event == EVENT_APPROVAL_RESPONSE:
+            return _Ansi.YELLOW
         if event == EVENT_WRITE_APPLIED:
             return _Ansi.GREEN
         if event == EVENT_WRITE_ROLLBACK:
             return _Ansi.YELLOW
         if event == EVENT_REFLECTOR_ACTION:
             return _Ansi.YELLOW
+        if event == EVENT_PLAN_REVISED:
+            return _Ansi.BLUE
+        if event == EVENT_REFLECTION_SCORED:
+            outcome = record["data"].get("outcome")
+            if outcome == "stop":
+                return _Ansi.RED
+            if outcome in {"retry", "replan"}:
+                return _Ansi.YELLOW
+            return _Ansi.GREEN
+        if event == EVENT_RECOVERY_ATTEMPTED:
+            return _Ansi.YELLOW
+        if event == EVENT_RECOVERY_EXHAUSTED:
+            return _Ansi.RED
+        if event == EVENT_RECOVERY_CLEARED:
+            return _Ansi.GREEN
+        if event == EVENT_BUDGET_WARNING:
+            return _Ansi.YELLOW
+        if event == EVENT_BUDGET_EXHAUSTED:
+            return _Ansi.RED
         if event == EVENT_RUN_END:
             return _Ansi.GREEN
         return _Ansi.CYAN
@@ -396,6 +488,8 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             _print_field(stream, "Budget Status", data.get("budget_status"), use_color=use_color)
         if data.get("budget_remaining") is not None:
             _print_field(stream, "Budget Remaining", data.get("budget_remaining"), use_color=use_color)
+        if data.get("budget_usage") is not None:
+            _print_field(stream, "Budget Usage", data.get("budget_usage"), use_color=use_color)
         if data.get("budget_stop_reason") is not None:
             _print_field(
                 stream,
@@ -404,6 +498,49 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                 use_color=use_color,
                 inline=True,
             )
+
+    def _print_approval_view_fields(data: dict[str, Any]) -> None:
+        _print_field(stream, "Approval ID", data.get("approval_request_id"), use_color=use_color, inline=True)
+        _print_field(stream, "Tool", data.get("tool_summary", data.get("tool")), use_color=use_color)
+        if data.get("risk_level") is not None:
+            _print_field(stream, "Risk Level", data.get("risk_level"), use_color=use_color, inline=True)
+        if data.get("reason") is not None:
+            _print_field(stream, "Reason", data.get("reason"), use_color=use_color)
+        if data.get("impact_summary") is not None:
+            _print_field(stream, "Impact Summary", data.get("impact_summary"), use_color=use_color)
+        if data.get("affected_files"):
+            _print_field(stream, "Affected Files", data.get("affected_files"), use_color=use_color)
+        if data.get("diff_preview") is not None:
+            _print_field(stream, "Diff Preview", data.get("diff_preview"), use_color=use_color)
+        if data.get("backup_plan") is not None:
+            _print_field(stream, "Backup Plan", data.get("backup_plan"), use_color=use_color)
+        if data.get("rollback_command") is not None:
+            _print_field(
+                stream,
+                "Rollback Command",
+                data.get("rollback_command"),
+                use_color=use_color,
+                inline=True,
+            )
+        if data.get("suggested_verification_command") is not None:
+            _print_field(
+                stream,
+                "Suggested Verification",
+                data.get("suggested_verification_command"),
+                use_color=use_color,
+                inline=True,
+            )
+        _print_budget_fields(data)
+        if data.get("recovery_state") is not None:
+            _print_field(stream, "Recovery State", data.get("recovery_state"), use_color=use_color)
+        if data.get("state_path") is not None:
+            _print_field(stream, "State Path", data.get("state_path"), use_color=use_color)
+        if data.get("resume_approve_command") is not None:
+            _print_field(stream, "Approve With", data.get("resume_approve_command"), use_color=use_color)
+        if data.get("resume_reject_command") is not None:
+            _print_field(stream, "Reject With", data.get("resume_reject_command"), use_color=use_color)
+        if data.get("show_pending_command") is not None:
+            _print_field(stream, "Review With", data.get("show_pending_command"), use_color=use_color)
 
     def _print_record(record: AuditEvent, iteration: int | None) -> None:
         data = record["data"]
@@ -496,6 +633,16 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                 _print_field(stream, "Approve With", data.get("resume_approve_command"), use_color=use_color)
             if data.get("resume_reject_command") is not None:
                 _print_field(stream, "Reject With", data.get("resume_reject_command"), use_color=use_color)
+        elif event == EVENT_APPROVAL_PRESENTED:
+            _print_approval_view_fields(data)
+        elif event == EVENT_APPROVAL_RESPONSE:
+            _print_field(stream, "Approval ID", data.get("approval_request_id"), use_color=use_color, inline=True)
+            _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
+            _print_field(stream, "Action", data.get("action"), use_color=use_color, inline=True)
+            if data.get("note") is not None:
+                _print_field(stream, "Note", data.get("note"), use_color=use_color)
+            if data.get("affected_files"):
+                _print_field(stream, "Affected Files", data.get("affected_files"), use_color=use_color)
         elif event == EVENT_TOOL_RESULT:
             status = "ok" if data.get("ok") else "error"
             _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
@@ -535,6 +682,49 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         elif event == EVENT_REFLECTOR_ACTION:
             for key, value in data.items():
                 _print_field(stream, key.replace("_", " ").title(), value, use_color=use_color)
+        elif event == EVENT_PLAN_REVISED:
+            _print_field(stream, "Plan Revision Reason", data.get("plan_revision_reason"), use_color=use_color)
+            _print_field(stream, "Current Step", data.get("current_step"), use_color=use_color)
+            _print_plan(stream, list(data.get("plan", [])), use_color=use_color)
+            if data.get("plan_version") is not None:
+                _print_field(stream, "Plan Version", data.get("plan_version"), use_color=use_color, inline=True)
+            if data.get("plan_revision_count") is not None:
+                _print_field(stream, "Plan Revision Count", data.get("plan_revision_count"), use_color=use_color, inline=True)
+            if data.get("plan_steps") is not None:
+                _print_field(stream, "Plan Steps", data.get("plan_steps"), use_color=use_color)
+            _print_budget_fields(data)
+        elif event == EVENT_REFLECTION_SCORED:
+            _print_field(stream, "Score", data.get("score"), use_color=use_color, inline=True)
+            _print_field(stream, "Outcome", data.get("outcome"), use_color=use_color, inline=True)
+            _print_field(stream, "Retryable", data.get("retryable"), use_color=use_color, inline=True)
+            if data.get("tool") is not None:
+                _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
+            if data.get("issue_type") is not None:
+                _print_field(stream, "Issue Type", data.get("issue_type"), use_color=use_color, inline=True)
+            if data.get("recovery_attempt_count") is not None:
+                _print_field(stream, "Recovery Attempt Count", data.get("recovery_attempt_count"), use_color=use_color, inline=True)
+            if data.get("recovery_attempt_total") is not None:
+                _print_field(stream, "Recovery Attempts Total", data.get("recovery_attempt_total"), use_color=use_color, inline=True)
+            if data.get("reflection_reason") is not None:
+                _print_field(stream, "Reason", data.get("reflection_reason"), use_color=use_color)
+            if data.get("recommended_next_action") is not None:
+                _print_field(stream, "Recommended Next Action", data.get("recommended_next_action"), use_color=use_color)
+            if data.get("budget_pressure") is not None:
+                _print_field(stream, "Budget Pressure", data.get("budget_pressure"), use_color=use_color)
+            if data.get("new_information") is not None:
+                _print_field(stream, "New Information", data.get("new_information"), use_color=use_color, inline=True)
+            _print_budget_fields(data)
+        elif event in {EVENT_RECOVERY_ATTEMPTED, EVENT_RECOVERY_EXHAUSTED, EVENT_RECOVERY_CLEARED}:
+            for key, value in data.items():
+                _print_field(stream, key.replace("_", " ").title(), value, use_color=use_color)
+        elif event in {EVENT_BUDGET_WARNING, EVENT_BUDGET_EXHAUSTED}:
+            if data.get("dimensions") is not None:
+                _print_field(stream, "Dimensions", data.get("dimensions"), use_color=use_color)
+            if data.get("attempted_tool") is not None:
+                _print_field(stream, "Attempted Tool", data.get("attempted_tool"), use_color=use_color, inline=True)
+            if data.get("attempted_step") is not None:
+                _print_field(stream, "Attempted Step", data.get("attempted_step"), use_color=use_color)
+            _print_budget_fields(data)
         elif event == EVENT_RUN_END:
             if data.get("status") is not None:
                 _print_field(stream, "Status", data.get("status"), use_color=use_color, inline=True)
@@ -542,6 +732,8 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
             _print_field(stream, "Observations", data.get("observation_count"), use_color=use_color, inline=True)
             if data.get("command_count") is not None:
                 _print_field(stream, "Commands", data.get("command_count"), use_color=use_color, inline=True)
+            if data.get("runtime_seconds") is not None:
+                _print_field(stream, "Runtime", f"{data.get('runtime_seconds')}s", use_color=use_color, inline=True)
             if data.get("plan_version") is not None:
                 _print_field(stream, "Plan Version", data.get("plan_version"), use_color=use_color, inline=True)
             if data.get("plan_revision_count") is not None:
@@ -552,6 +744,8 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                     use_color=use_color,
                     inline=True,
                 )
+            if data.get("recovery_attempt_total") is not None:
+                _print_field(stream, "Recovery Attempts", data.get("recovery_attempt_total"), use_color=use_color, inline=True)
             if data.get("command_summaries"):
                 _print_field(stream, "Command Summaries", data.get("command_summaries"), use_color=use_color)
             if data.get("write_count") is not None:
@@ -596,15 +790,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.resume_run is None and args.rollback_run is None and not args.goal:
-        parser.error("goal is required unless --resume-run or --rollback-run is provided")
+        if args.show_pending_run is None:
+            parser.error("goal is required unless --resume-run, --rollback-run, or --show-pending-run is provided")
     if args.resume_run is not None and not (args.approve or args.reject):
         parser.error("--resume-run requires either --approve or --reject")
     if (args.approve or args.reject) and args.resume_run is None:
         parser.error("--approve/--reject may only be used with --resume-run")
+    if args.decision_note is not None and args.resume_run is None:
+        parser.error("--decision-note may only be used with --resume-run")
     if args.resume_run is not None and args.goal is not None:
         parser.error("goal is not accepted when using --resume-run")
     if args.rollback_run is not None and args.goal is not None:
         parser.error("goal is not accepted when using --rollback-run")
+    if args.show_pending_run is not None and args.goal is not None:
+        parser.error("goal is not accepted when using --show-pending-run")
 
     # ── Load config ──────────────────────────────────────────────────────────
     try:
@@ -725,9 +924,37 @@ def main(argv: list[str] | None = None) -> int:
             config = _with_workspace(resume_workspace)
 
         initial_state["resume_action"] = "approve" if args.approve else "reject"
+        initial_state["approval_response_note"] = args.decision_note
         user_goal = initial_state["user_goal"]
         mode = "resume"
         resume_action = initial_state["resume_action"]
+    elif args.show_pending_run is not None:
+        run_id = args.show_pending_run
+        try:
+            initial_state = load_run_state(run_id, config)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"[linux-agent] Could not load paused run {run_id}: {exc}", file=sys.stderr)
+            return 1
+
+        if initial_state.get("pending_approval") is None:
+            print(f"[linux-agent] Run {run_id} has no pending approval.", file=sys.stderr)
+            return 1
+
+        approval_view = build_approval_view(
+            initial_state,
+            config,
+            state_path=state_path(run_id, config),
+        )
+        with AuditLogger(run_id, config.log_dir, listener=verbose_listener) as audit:
+            audit.log(
+                EVENT_APPROVAL_PRESENTED,
+                {
+                    **approval_view,
+                    "source": "show_pending_run",
+                },
+            )
+        print(format_approval_view(approval_view, mode=str(getattr(config, "approval_ui_mode", "compact"))))
+        return 0
     else:
         run_id = str(uuid.uuid4())
         initial_state = AgentState(
@@ -743,6 +970,7 @@ def main(argv: list[str] | None = None) -> int:
             plan_steps=[],
             last_reflection=None,
             recovery_state=None,
+            recovery_attempt_total=0,
             budget_status={
                 "iteration_count": 0,
                 "command_count": 0,
@@ -756,6 +984,7 @@ def main(argv: list[str] | None = None) -> int:
             risk_decision=None,
             pending_approval=None,
             resume_action=None,
+            approval_response_note=None,
             pending_verification=None,
             last_write=None,
             last_verification=None,
@@ -797,6 +1026,16 @@ def main(argv: list[str] | None = None) -> int:
 
     print(final_state.get("final_answer") or "(no answer produced)")
     if final_state.get("risk_decision") == "needs_approval":
+        try:
+            approval_view = build_approval_view(
+                final_state,
+                config,
+                state_path=state_path(str(final_state["run_id"]), config),
+            )
+        except ValueError:
+            return 2
+        print()
+        print(format_approval_view(approval_view, mode=str(getattr(config, "approval_ui_mode", "compact"))))
         return 2
     return 0
 

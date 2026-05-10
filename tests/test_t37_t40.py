@@ -15,7 +15,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 
 from linux_agent.app import _make_verbose_event_printer
-from linux_agent.audit import EVENT_PLAN_UPDATE, EVENT_REFLECTOR_ACTION, EVENT_RUN_END
+from linux_agent.audit import EVENT_BUDGET_WARNING, EVENT_PLAN_REVISED, EVENT_PLAN_UPDATE, EVENT_REFLECTOR_ACTION, EVENT_RUN_END
 from linux_agent.config import AgentConfig
 from linux_agent.graph import build_graph
 from linux_agent.state import AgentState
@@ -259,10 +259,40 @@ class TestVerboseBudgetRendering:
             {
                 "run_id": "run-1",
                 "ts": "2026-05-10T00:00:01+00:00",
-                "event": EVENT_REFLECTOR_ACTION,
+                "event": EVENT_BUDGET_WARNING,
                 "data": {
-                    "reason": "budget_warning",
                     "dimensions": ["max_command_count"],
+                    "budget_status": {
+                        "iteration_count": 1,
+                        "command_count": 1,
+                        "elapsed_seconds": 10,
+                        "warning_triggered": True,
+                    },
+                    "budget_remaining": {
+                        "iterations_remaining": 11,
+                        "commands_remaining": 0,
+                        "runtime_remaining_seconds": 890,
+                        "plan_revisions_remaining": 2,
+                        "recovery_attempts_remaining": 2,
+                    },
+                },
+            }
+        )
+        emit(
+            {
+                "run_id": "run-1",
+                "ts": "2026-05-10T00:00:01+00:00",
+                "event": EVENT_PLAN_REVISED,
+                "data": {
+                    "plan": ["Run pytest", "Read failing file"],
+                    "current_step": "Read failing file",
+                    "plan_steps": [
+                        {"id": "step_1", "title": "Run pytest", "status": "blocked", "rationale": None, "evidence_refs": [1]},
+                        {"id": "step_2", "title": "Read failing file", "status": "in_progress", "rationale": "Follow-up after run_command failed.", "evidence_refs": [1]},
+                    ],
+                    "plan_version": 2,
+                    "plan_revision_count": 1,
+                    "plan_revision_reason": "appended_step_after_failed_observation",
                     "budget_status": {
                         "iteration_count": 1,
                         "command_count": 1,
@@ -311,7 +341,21 @@ class TestVerboseBudgetRendering:
                         "plan_revisions_remaining": 2,
                         "recovery_attempts_remaining": 2,
                     },
+                    "budget_usage": {
+                        "iterations_used": 1,
+                        "iteration_limit": 12,
+                        "commands_used": 1,
+                        "command_limit": 1,
+                        "runtime_seconds": 10,
+                        "runtime_limit_seconds": 900,
+                        "plan_revisions_used": 1,
+                        "plan_revision_limit": 3,
+                        "recovery_attempts_used": 1,
+                        "recovery_attempt_limit_per_issue": 2,
+                    },
                     "budget_stop_reason": "max_command_count",
+                    "runtime_seconds": 10,
+                    "recovery_attempt_total": 1,
                     "verification_status": None,
                     "verification_command": None,
                     "verification_exit_code": None,
@@ -327,4 +371,7 @@ class TestVerboseBudgetRendering:
         assert "Plan Revision Count: 1" in rendered
         assert "Budget Status:" in rendered
         assert "Budget Remaining:" in rendered
+        assert "[linux-agent] Iteration 1 | Plan Revised" in rendered
         assert "Budget Stop Reason: max_command_count" in rendered
+        assert "Recovery Attempts: 1" in rendered
+        assert "Runtime: 10s" in rendered

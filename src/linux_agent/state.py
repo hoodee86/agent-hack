@@ -55,6 +55,10 @@ class ApprovalRequest(TypedDict):
     impact_summary: str
     diff_preview: str | None
     backup_plan: str | None
+    affected_files: NotRequired[list[str]]
+    risk_level: NotRequired[Literal["low", "medium", "high"]]
+    suggested_verification_command: NotRequired[str | None]
+    rollback_command: NotRequired[str | None]
 
 
 class WriteSummary(TypedDict):
@@ -178,6 +182,7 @@ class AgentState(TypedDict):
     plan_steps: NotRequired[list[PlanStep]]
     last_reflection: NotRequired[ReflectionResult | None]
     recovery_state: NotRequired[RecoveryState | None]
+    recovery_attempt_total: NotRequired[int]
     budget_status: NotRequired[BudgetStatus]
     budget_stop_reason: NotRequired[BudgetStopReason | None]
 
@@ -198,6 +203,9 @@ class AgentState(TypedDict):
 
     # Set only when a paused run is resumed from the CLI.
     resume_action: Literal["approve", "reject"] | None
+
+    # Optional reviewer note recorded with the latest approval response.
+    approval_response_note: NotRequired[str | None]
 
     # Populated after a successful write until a verification command runs.
     pending_verification: WriteSummary | None

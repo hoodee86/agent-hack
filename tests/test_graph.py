@@ -462,6 +462,11 @@ class TestGraphSecurityBlocking:
             for event in events
         )
         assert any(event["event"] == "approval_requested" for event in events)
+        approval_presented = next(event for event in events if event["event"] == "approval_presented")
+        assert approval_presented["data"]["approval_request_id"] == result["pending_approval"]["id"]
+        assert approval_presented["data"]["affected_files"] == ["evil.txt"]
+        assert approval_presented["data"]["rollback_command"] == f"--rollback-run {run_id}"
+        assert "commands_remaining" in approval_presented["data"]["budget_remaining"]
 
     def test_approved_resume_executes_pending_write_tool(self, tmp_path: Path) -> None:
         log_dir = tmp_path / "logs"
@@ -617,6 +622,7 @@ class TestGraphSecurityBlocking:
 
         resumed_app = build_graph(cfg, chat_model=_stub_llm(_final_turn("unused")))
         resumed_state = AgentState(**{**paused, "resume_action": "reject"})  # type: ignore[misc]
+        resumed_state["approval_response_note"] = "The requested write is still too broad."
 
         result = resumed_app.invoke(resumed_state)
 
@@ -625,7 +631,15 @@ class TestGraphSecurityBlocking:
         assert result["observations"] == []
         assert "rejected approval request" in (result["final_answer"] or "").lower()
         assert "narrower manual change" in (result["final_answer"] or "").lower()
+        assert "Reviewer note: The requested write is still too broad." in (result["final_answer"] or "")
         assert not state_path(run_id, cfg).exists()
+
+        import json as _json
+
+        events = [_json.loads(line) for line in (cfg.log_dir / f"{run_id}.jsonl").read_text().splitlines() if line]
+        approval_response = next(event for event in events if event["event"] == "approval_response")
+        assert approval_response["data"]["action"] == "reject"
+        assert approval_response["data"]["note"] == "The requested write is still too broad."
 
 
 class TestGraphCircuitBreaker:
@@ -733,3 +747,5 @@ class TestAuditLogging:
         assert policy_event["data"]["reason"] == "Write operations require explicit approval before execution."
         assert policy_event["data"]["approval_request_id"] == result["pending_approval"]["id"]
         assert "notes.txt" in policy_event["data"]["impact_summary"]
+        assert policy_event["data"]["affected_files"] == ["notes.txt"]
+        assert policy_event["data"]["rollback_command"] == f"--rollback-run {run_id}"

@@ -327,6 +327,9 @@ def _build_approval_request(
     impact_summary: str,
     diff_preview: str | None,
     backup_plan: str | None,
+    affected_files: list[str],
+    suggested_verification_command: str | None,
+    rollback_command: str | None,
 ) -> "ApprovalRequest":
     return {
         "id": f"approval_{uuid4()}",
@@ -336,7 +339,38 @@ def _build_approval_request(
         "impact_summary": impact_summary,
         "diff_preview": diff_preview,
         "backup_plan": backup_plan,
+        "affected_files": affected_files,
+        "risk_level": tool_call["risk_level"],
+        "suggested_verification_command": suggested_verification_command,
+        "rollback_command": rollback_command,
     }
+
+
+def _suggest_verification_command(
+    config: "AgentConfig",
+    affected_files: list[str],
+) -> str | None:
+    if not affected_files:
+        return None
+
+    suffixes = {Path(path).suffix.lower() for path in affected_files}
+    if not suffixes.intersection({".py", ".pyi", ".toml", ".yaml", ".yml"}):
+        return None
+
+    candidates = (
+        "uv run pytest",
+        "pytest",
+        "python -m pytest",
+        "uv run ruff",
+        "ruff",
+        "python -m ruff",
+    )
+    allowlist = [str(item).strip() for item in config.command_allowlist if str(item).strip()]
+    for candidate in candidates:
+        for allowed in allowlist:
+            if allowed == candidate or allowed.startswith(f"{candidate} "):
+                return allowed
+    return None
 
 
 def _assess_write_file_call(
@@ -387,6 +421,9 @@ def _assess_write_file_call(
         impact_summary=f"This request would {action} workspace file '{display_path}'.",
         diff_preview=_preview_text(raw_content),
         backup_plan=_backup_plan(config, run_id),
+        affected_files=[display_path],
+        suggested_verification_command=_suggest_verification_command(config, [display_path]),
+        rollback_command=None if run_id is None else f"--rollback-run {run_id}",
     )
     return _needs_approval(request)
 
@@ -454,6 +491,9 @@ def _assess_apply_patch_call(
         ),
         diff_preview=_preview_text(raw_patch),
         backup_plan=_backup_plan(config, run_id),
+        affected_files=display_paths,
+        suggested_verification_command=_suggest_verification_command(config, display_paths),
+        rollback_command=None if run_id is None else f"--rollback-run {run_id}",
     )
     return _needs_approval(request)
 
