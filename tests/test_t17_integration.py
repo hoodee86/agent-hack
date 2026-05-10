@@ -289,6 +289,77 @@ class TestScenarioRunCommand:
         assert "Executed commands:" in (result["final_answer"] or "")
         assert "pwd [cwd=.] -> ok" in (result["final_answer"] or "")
 
+    def test_agent_runs_failing_pytest_reads_failure_file_and_summarizes_it(self, tmp_path: Path) -> None:
+        """Stage-2 acceptance: failing pytest output can drive a follow-up read and summary."""
+        (tmp_path / "test_failure.py").write_text(
+            "def test_failure() -> None:\n    assert 1 == 2\n",
+            encoding="utf-8",
+        )
+        cfg = _make_config(tmp_path)
+        llm = _stub(
+            _tool_turn(
+                "run_command",
+                {"command": "pytest -q test_failure.py", "cwd": "."},
+                content="Run the failing pytest case first",
+            ),
+            _tool_turn(
+                "read_file",
+                {"path": "test_failure.py"},
+                content="Read the failing test before summarizing",
+            ),
+            _final_turn(
+                "pytest fails in test_failure.py because the assertion expects 1 == 2. Read the failing test before changing the implementation."
+            ),
+        )
+        app = build_graph(cfg, chat_model=llm)
+
+        result = app.invoke(_initial_state("Run pytest and explain the failure", str(tmp_path)))
+
+        assert [obs["tool"] for obs in result["observations"]] == ["run_command", "read_file"]
+        command_result = result["observations"][0]["result"]
+        assert result["observations"][0]["ok"] is False
+        assert command_result is not None
+        assert command_result["command"] == "pytest -q test_failure.py"  # type: ignore[index]
+        assert command_result["exit_code"] == 1  # type: ignore[index]
+        combined_output = f"{command_result['stdout']}\n{command_result['stderr']}"  # type: ignore[index]
+        assert "test_failure.py" in combined_output
+        assert "AssertionError" in combined_output
+        assert result["observations"][1]["ok"] is True
+        assert "Executed commands:" in (result["final_answer"] or "")
+        assert "pytest -q test_failure.py [cwd=.] -> failed" in (result["final_answer"] or "")
+
+    def test_agent_runs_mypy_and_suggests_next_step(self, tmp_path: Path) -> None:
+        """Stage-2 acceptance: type-check failures can be summarized into a next-step suggestion."""
+        (tmp_path / "type_issue.py").write_text(
+            "def returns_int() -> int:\n    return \"oops\"\n",
+            encoding="utf-8",
+        )
+        cfg = _make_config(tmp_path)
+        llm = _stub(
+            _tool_turn(
+                "run_command",
+                {"command": "mypy type_issue.py", "cwd": "."},
+                content="Run mypy before proposing a next step",
+            ),
+            _final_turn(
+                "mypy reports a return-type mismatch in type_issue.py; next read that file or fix the declared return type."
+            ),
+        )
+        app = build_graph(cfg, chat_model=llm)
+
+        result = app.invoke(_initial_state("Run mypy and suggest the next step", str(tmp_path)))
+
+        obs = result["observations"][0]
+        assert obs["tool"] == "run_command"
+        assert obs["ok"] is False
+        assert obs["result"] is not None
+        assert obs["result"]["command"] == "mypy type_issue.py"  # type: ignore[index]
+        assert obs["result"]["exit_code"] == 1  # type: ignore[index]
+        assert "type_issue.py" in obs["result"]["stdout"]  # type: ignore[index]
+        assert "error:" in obs["result"]["stdout"]  # type: ignore[index]
+        assert "Executed commands:" in (result["final_answer"] or "")
+        assert "mypy type_issue.py [cwd=.] -> failed" in (result["final_answer"] or "")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scenario 5 – security block (path traversal)

@@ -343,6 +343,44 @@ class TestGraphHappyPath:
             for event in events
         )
 
+    def test_failed_command_history_is_available_to_next_turn_follow_up(self, tmp_path: Path) -> None:
+        """Failed run_command results should flow into the next planner turn via ToolMessage."""
+        (tmp_path / "test_failure.py").write_text(
+            "def test_failure() -> None:\n    assert 1 == 2\n",
+            encoding="utf-8",
+        )
+        cfg = _make_config(tmp_path)
+        llm = _StubLLM(
+            turns=[
+                _tool_turn(
+                    "run_command",
+                    {"command": "pytest -q test_failure.py", "cwd": "."},
+                    content="Run the failing test first",
+                ),
+                _tool_turn(
+                    "read_file",
+                    {"path": "test_failure.py"},
+                    content="Read the failing test file before summarizing",
+                ),
+                _final_turn("pytest fails in test_failure.py because the assertion expects 1 == 2."),
+            ],
+            captures=[],
+        )
+        app = build_graph(cfg, chat_model=llm)
+
+        result = app.invoke(_initial_state("Diagnose the failing pytest case", str(tmp_path)))
+
+        assert [obs["tool"] for obs in result["observations"]] == ["run_command", "read_file"]
+        assert result["observations"][0]["ok"] is False
+        assert result["observations"][1]["ok"] is True
+        assert len(llm.captures) == 3
+        tool_payload = llm.captures[1][-2].content
+        assert isinstance(tool_payload, str)
+        assert '"tool": "run_command"' in tool_payload
+        assert '"exit_code": 1' in tool_payload
+        assert "test_failure.py" in tool_payload
+        assert "Executed commands:" in (result["final_answer"] or "")
+
     def test_command_timeout_stops_with_explicit_timeout_summary(self, tmp_path: Path) -> None:
         """Reflector should stop immediately when a command times out."""
         test_file = tmp_path / "test_sleep.py"

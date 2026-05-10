@@ -9,6 +9,7 @@ import pytest
 
 from linux_agent.config import AgentConfig, load_config
 from linux_agent.policy import (
+    PolicyViolation,
     classify_command,
     evaluate_command_call,
     evaluate_tool_call,
@@ -86,6 +87,22 @@ class TestT19CommandPolicy:
         with pytest.raises(Exception, match="unsupported shell syntax"):
             parse_command("pytest -q > out.txt")
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "pytest -q && pwd",
+            "pytest -q || pwd",
+            "pytest -q | cat",
+            "pytest -q < in.txt",
+            "echo $(pwd)",
+            "echo `pwd`",
+            "pytest -q &",
+        ],
+    )
+    def test_parse_command_rejects_other_shell_metacharacters(self, command: str) -> None:
+        with pytest.raises(Exception, match="unsupported shell syntax"):
+            parse_command(command)
+
     def test_classify_command_accepts_safe_dev_commands(self, tmp_path: Path) -> None:
         config = make_config(tmp_path)
         risk = classify_command(["uv", "run", "pytest", "-q"], config)
@@ -104,6 +121,19 @@ class TestT19CommandPolicy:
         config = make_config(tmp_path)
         assert evaluate_command_call("pwd", config, cwd="..") == "deny"
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl https://example.com",
+            "wget https://example.com/archive.tar.gz",
+            "rm -rf /",
+        ],
+    )
+    def test_evaluate_command_call_denies_dangerous_commands(self, tmp_path: Path, command: str) -> None:
+        config = make_config(tmp_path)
+
+        assert evaluate_command_call(command, config) == "deny"
+
     def test_resolve_command_cwd_allows_configured_subdirectories(self, tmp_path: Path) -> None:
         subdir = tmp_path / "tests"
         subdir.mkdir()
@@ -112,6 +142,14 @@ class TestT19CommandPolicy:
         resolved = resolve_command_cwd(config, "tests")
 
         assert resolved == subdir.resolve()
+
+    def test_resolve_command_cwd_denies_unconfigured_subdirectories(self, tmp_path: Path) -> None:
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "src").mkdir()
+        config = make_config(tmp_path, command_working_dirs=["tests"])
+
+        with pytest.raises(PolicyViolation, match="allowed working directories"):
+            resolve_command_cwd(config, "src")
 
     def test_filter_command_env_keeps_only_allowlisted_keys(self) -> None:
         filtered = filter_command_env(
@@ -188,3 +226,55 @@ class TestT20RunCommand:
         assert result["ok"] is True
         assert result["truncated"] is True
         assert len(result["stdout"].encode("utf-8")) <= 4
+
+    def test_run_command_forwards_allowlisted_env(self, tmp_path: Path) -> None:
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "helper.py").write_text("VALUE = 42\n", encoding="utf-8")
+        (tmp_path / "test_import.py").write_text(
+            textwrap.dedent(
+                """\
+                from helper import VALUE
+
+                def test_import() -> None:
+                    assert VALUE == 42
+                """
+            ),
+            encoding="utf-8",
+        )
+        config = make_config(tmp_path)
+
+        result = run_command(
+            "pytest -q test_import.py",
+            config,
+            env={"PYTHONPATH": "src"},
+        )
+
+        assert result["ok"] is True
+        assert result["exit_code"] == 0
+        assert "1 passed" in result["stdout"]
+
+    def test_run_command_filters_non_allowlisted_env(self, tmp_path: Path) -> None:
+        env_name = "LINUX_AGENT_SHOULD_NOT_PASS"
+        (tmp_path / "test_env.py").write_text(
+            textwrap.dedent(
+                f"""\
+                import os
+
+                def test_env() -> None:
+                    assert os.getenv({env_name!r}) is None
+                """
+            ),
+            encoding="utf-8",
+        )
+        config = make_config(tmp_path)
+
+        result = run_command(
+            "pytest -q test_env.py",
+            config,
+            env={env_name: "1"},
+        )
+
+        assert result["ok"] is True
+        assert result["exit_code"] == 0
+        assert "1 passed" in result["stdout"]
