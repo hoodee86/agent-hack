@@ -842,7 +842,7 @@ def write_file(
             "error": "file already exists",
         }
 
-    if normalized_mode in {"append", "overwrite"} and old_text is None:
+    if normalized_mode == "append" and old_text is None:
         return {
             "ok": False,
             "path": display_path,

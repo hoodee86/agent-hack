@@ -286,6 +286,25 @@ class TestWriteFile:
         assert result["backup_paths"]
         assert "a/note.txt" in result["diff"]
 
+    def test_overwrite_creates_missing_file(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+        config = make_config(tmp_path)
+
+        result = write_file(
+            "docs/output.md",
+            "hello\nworld\n",
+            config,
+            mode="overwrite",
+            run_id="run-overwrite-create",
+        )
+
+        assert result["ok"] is True
+        assert (tmp_path / "docs" / "output.md").read_text(encoding="utf-8") == "hello\nworld\n"
+        assert result["changed_files"] == ["docs/output.md"]
+        assert result["backup_paths"] == []
+        assert result["created"] is True
+        assert "b/docs/output.md" in result["diff"]
+
     def test_create_only_refuses_existing_file(self, tmp_path: Path) -> None:
         target = tmp_path / "note.txt"
         target.write_text("alpha\n", encoding="utf-8")

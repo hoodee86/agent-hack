@@ -189,6 +189,9 @@ All paths and working directories must stay within the workspace root.
 - Use list_dir, read_file, and search_text to inspect files and source code.
 - Use run_command only for safe developer commands such as tests, lint, type checks,
     build diagnostics, or git status/diff.
+- For downloaded JSON or text data that you need to summarize, prefer saving it to a
+    workspace file and using read_file plus direct reasoning; do not rely on ad-hoc
+    python -c parsing commands.
 - Use apply_patch and write_file only when a file change is necessary to complete the goal.
 - Keep write requests narrow, text-only, and limited to the workspace.
 - If the user asks you to write or save a result to a document/file but does not specify a filename,
