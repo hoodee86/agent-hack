@@ -20,7 +20,8 @@ class ToolCall(TypedDict):
 
     # Provider-generated tool-call id so ToolMessage can be correlated
     id: str
-    # Tool name – one of: list_dir | read_file | search_text | run_command
+    # Tool name – one of the current tool schemas; future approval-only
+    # proposals may also include write_file or apply_patch.
     name: str
     # Raw arguments forwarded to the skill function unchanged
     args: dict[str, object]
@@ -42,6 +43,18 @@ class Observation(TypedDict):
     error: str | None
     # Wall-clock time for the skill call in milliseconds
     duration_ms: int
+
+
+class ApprovalRequest(TypedDict):
+    """Structured approval metadata produced by Policy Guard."""
+
+    id: str
+    tool: str
+    args: dict[str, object]
+    reason: str
+    impact_summary: str
+    diff_preview: str | None
+    backup_plan: str | None
 
 
 class AgentState(TypedDict):
@@ -76,9 +89,11 @@ class AgentState(TypedDict):
     # Accumulated results from every tool execution in this run
     observations: list[Observation]
 
-    # Latest decision from the Policy Guard node ("allow" | "deny")
-    # Phase 1 omits "needs_approval" – that is introduced in phase 3
-    risk_decision: Literal["allow", "deny"] | None
+    # Latest decision from the Policy Guard node.
+    risk_decision: Literal["allow", "deny", "needs_approval"] | None
+
+    # Populated when Policy Guard pauses a write operation for approval.
+    pending_approval: ApprovalRequest | None
 
     # Total number of tool executions so far (incremented by Tool Executor)
     iteration_count: int

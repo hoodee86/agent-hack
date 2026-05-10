@@ -243,7 +243,12 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
         if event == EVENT_TOOL_PROPOSED:
             return _Ansi.YELLOW
         if event == EVENT_POLICY_DECISION:
-            return _Ansi.GREEN if record["data"].get("decision") == "allow" else _Ansi.RED
+            decision = record["data"].get("decision")
+            if decision == "allow":
+                return _Ansi.GREEN
+            if decision == "needs_approval":
+                return _Ansi.YELLOW
+            return _Ansi.RED
         if event == EVENT_TOOL_RESULT:
             return _Ansi.GREEN if record["data"].get("ok") else _Ansi.RED
         if event == EVENT_REFLECTOR_ACTION:
@@ -341,6 +346,12 @@ def _make_verbose_event_printer(stream: TextIO) -> AuditEventListener:
                 _print_command_fields(data)
             else:
                 _print_field(stream, "Args", data.get("args"), use_color=use_color)
+            if data.get("reason") is not None:
+                _print_field(stream, "Reason", data.get("reason"), use_color=use_color)
+            if data.get("impact_summary") is not None:
+                _print_field(stream, "Impact Summary", data.get("impact_summary"), use_color=use_color)
+            if data.get("backup_plan") is not None:
+                _print_field(stream, "Backup Plan", data.get("backup_plan"), use_color=use_color)
         elif event == EVENT_TOOL_RESULT:
             status = "ok" if data.get("ok") else "error"
             _print_field(stream, "Tool", data.get("tool"), use_color=use_color, inline=True)
@@ -453,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
         proposed_tool_call=None,
         observations=[],
         risk_decision=None,
+        pending_approval=None,
         iteration_count=0,
         consecutive_failures=0,
         final_answer=None,

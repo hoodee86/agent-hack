@@ -40,6 +40,7 @@ def _fake_final_state(answer: str, iterations: int = 1) -> AgentState:
         proposed_tool_call=None,
         observations=[],
         risk_decision=None,
+        pending_approval=None,
         iteration_count=iterations,
         consecutive_failures=0,
         final_answer=answer,

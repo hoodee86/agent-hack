@@ -4,7 +4,7 @@ LangGraph state machine for the Linux Agent (T9-T14).
 Nodes
 -----
 - planner      (T9):  LLM-powered; decides next tool call or signals completion.
-- policy_guard (T10): Enforces read-only policy; denies or allows the proposed tool.
+- policy_guard (T10): Enforces the security policy; allows, denies, or pauses for approval.
 - tool_executor(T11): Dispatches to skills; records an Observation.
 - reflector    (T12): Pure-logic circuit-breaker; checks iteration/failure limits.
 - finalizer    (T13): Emits the final answer and writes the run_end audit event.
@@ -16,7 +16,7 @@ Graph topology
                └────────────────────────────────────────────────────────┘
 
     planner      → finalizer   when final_answer is set
-    policy_guard → finalizer   when risk_decision == "deny"
+    policy_guard → finalizer   when risk_decision is "deny" or "needs_approval"
     reflector    → finalizer   when circuit-breaker trips
     finalizer    → END
 """
@@ -54,8 +54,8 @@ from linux_agent.audit import (
 from linux_agent.config import AgentConfig
 from linux_agent.policy import (
     PolicyViolation,
+    assess_tool_call,
     classify_command,
-    evaluate_tool_call,
     parse_command,
 )
 from linux_agent.skills.filesystem import list_dir, read_file
@@ -333,6 +333,8 @@ def _classify_tool_risk(
     args: dict[str, object],
     config: AgentConfig,
 ) -> str:
+    if name in {"apply_patch", "write_file"}:
+        return "high"
     if name != "run_command":
         return "low"
 
@@ -684,31 +686,59 @@ def _make_policy_guard(
         tc = state["proposed_tool_call"]
         if tc is None:
             # No tool proposed (Planner set final_answer); allow trivially
-            return {"risk_decision": "allow"}
+            return {"risk_decision": "allow", "pending_approval": None}
 
-        decision = evaluate_tool_call(tc, config)
+        assessment = assess_tool_call(tc, config, run_id=state["run_id"])
+        decision = assessment["decision"]
+        approval_request = assessment["approval_request"]
+
+        audit_payload: dict[str, Any] = {
+            **_tool_call_audit_payload(tc),
+            "decision": decision,
+        }
+        if assessment["reason"] is not None:
+            audit_payload["reason"] = assessment["reason"]
+        if approval_request is not None:
+            audit_payload["approval_request_id"] = approval_request["id"]
+            audit_payload["impact_summary"] = approval_request["impact_summary"]
+            audit_payload["diff_preview"] = approval_request["diff_preview"]
+            audit_payload["backup_plan"] = approval_request["backup_plan"]
 
         _one_shot_audit(
             state["run_id"],
             config.log_dir,
             EVENT_POLICY_DECISION,
-            {
-                **_tool_call_audit_payload(tc),
-                "decision": decision,
-            },
+            audit_payload,
             event_listener,
         )
 
         if decision == "deny":
             return {
                 "risk_decision": "deny",
+                "pending_approval": None,
                 "final_answer": (
                     f"Operation denied by security policy: "
                     f"tool '{tc['name']}' with args {tc['args']} is not permitted."
+                    + (
+                        f" Reason: {assessment['reason']}."
+                        if assessment["reason"] is not None
+                        else ""
+                    )
                 ),
             }
 
-        return {"risk_decision": "allow"}
+        if decision == "needs_approval" and approval_request is not None:
+            return {
+                "risk_decision": "needs_approval",
+                "pending_approval": approval_request,
+                "final_answer": (
+                    f"Approval required before executing tool '{tc['name']}'. "
+                    f"{approval_request['impact_summary']} "
+                    f"Reason: {approval_request['reason']}"
+                ),
+            }
+
+        return {"risk_decision": "allow", "pending_approval": None}
 
     return policy_guard
 
@@ -955,7 +985,7 @@ def _route_planner(state: AgentState) -> str:
 
 
 def _route_policy_guard(state: AgentState) -> str:
-    if state.get("risk_decision") == "deny":
+    if state.get("risk_decision") in {"deny", "needs_approval"}:
         return "finalizer"
     return "tool_executor"
 
@@ -1013,6 +1043,7 @@ def build_graph(
             "proposed_tool_call": None,
             "observations": [],
             "risk_decision": None,
+            "pending_approval": None,
             "iteration_count": 0,
             "consecutive_failures": 0,
             "final_answer": None,

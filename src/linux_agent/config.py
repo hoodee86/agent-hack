@@ -106,6 +106,18 @@ class AgentConfig(BaseModel):
     # Workspace-relative directories where commands may execute
     command_working_dirs: list[str] = Field(default_factory=lambda: ["."])
 
+    # --- Phase-3 write controls -----------------------------------------
+    # Keep write tools behind an approval gate by default.
+    write_requires_approval: bool = True
+    # Maximum UTF-8 bytes accepted for a proposed patch or write payload.
+    max_patch_bytes: int = Field(default=32768, ge=1)
+    # Maximum patch hunks allowed before Policy Guard denies the request.
+    max_patch_hunks: int = Field(default=24, ge=1)
+    # Where backups will be stored once write execution is implemented.
+    backup_dir: Path = Field(default=Path(".linux-agent/backups"))
+    # Roll back automatically after failed verification runs by default.
+    auto_rollback_on_verify_failure: bool = True
+
     # --- LLM -------------------------------------------------------------
     llm_model: str = "deepseek-v4-pro"
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -136,7 +148,7 @@ class AgentConfig(BaseModel):
         """Resolve ~ and relative paths to an absolute path."""
         return Path(v).expanduser().resolve()
 
-    @field_validator("log_dir", mode="before")
+    @field_validator("log_dir", "backup_dir", mode="before")
     @classmethod
     def _expand_log_dir(cls, v: Any) -> Path:
         return Path(v).expanduser()
@@ -221,7 +233,7 @@ def load_config(path: str | None = None) -> AgentConfig:
             loaded = yaml.safe_load(fh)
             if isinstance(loaded, dict):
                 data = loaded
-        for key in ("workspace_root", "log_dir"):
+        for key in ("workspace_root", "log_dir", "backup_dir"):
             value = data.get(key)
             if isinstance(value, str):
                 candidate = Path(value).expanduser()

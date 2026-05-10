@@ -40,6 +40,7 @@ def _initial_state(
         proposed_tool_call=None,
         observations=[],
         risk_decision=None,
+        pending_approval=None,
         iteration_count=0,
         consecutive_failures=0,
         final_answer=None,
@@ -422,8 +423,8 @@ class TestGraphSecurityBlocking:
         assert "denied" in (result["final_answer"] or "").lower()
         assert result["iteration_count"] == 0  # ToolExecutor never ran
 
-    def test_write_tool_denied(self, tmp_path: Path) -> None:
-        """PolicyGuard denies a non-read-only tool."""
+    def test_write_tool_requires_approval(self, tmp_path: Path) -> None:
+        """PolicyGuard pauses write tools for approval instead of executing them."""
         cfg = _make_config(tmp_path)
         llm = _stub_llm(
             _tool_turn(
@@ -432,10 +433,22 @@ class TestGraphSecurityBlocking:
                 content="Writing file",
             )
         )
-        app = build_graph(cfg, chat_model=llm)
+        events: list[dict[str, Any]] = []
+        app = build_graph(cfg, chat_model=llm, event_listener=events.append)
         result = app.invoke(_initial_state("Write a file", str(tmp_path)))
-        assert result["risk_decision"] == "deny"
+
+        assert result["risk_decision"] == "needs_approval"
+        assert result["pending_approval"] is not None
+        assert result["pending_approval"]["tool"] == "write_file"
+        assert "approval required" in (result["final_answer"] or "").lower()
         assert result["iteration_count"] == 0
+        assert result["observations"] == []
+        assert any(
+            event["event"] == "policy_decision"
+            and event["data"].get("decision") == "needs_approval"
+            and event["data"].get("reason")
+            for event in events
+        )
 
 
 class TestGraphCircuitBreaker:
@@ -516,3 +529,30 @@ class TestAuditLogging:
         assert by_type["tool_result"]["data"]["exit_code"] == 0
         assert by_type["tool_result"]["data"]["command"] == "pwd"
         assert by_type["run_end"]["data"]["command_count"] == 1
+
+    def test_write_tool_policy_decision_logs_approval_reason(self, tmp_path: Path) -> None:
+        """Approval-gated write requests should persist structured approval metadata."""
+        import json as _json
+
+        log_dir = tmp_path / "logs"
+        cfg = _make_config(tmp_path, log_dir=log_dir)
+        run_id = str(uuid.uuid4())
+        llm = _stub_llm(
+            _tool_turn(
+                "write_file",
+                {"path": "notes.txt", "content": "updated"},
+                content="Write notes.txt",
+            )
+        )
+        app = build_graph(cfg, chat_model=llm)
+        state = _initial_state("Write notes.txt", str(tmp_path))
+        state = AgentState(**{**state, "run_id": run_id})  # type: ignore[misc]
+
+        result = app.invoke(state)
+
+        events = [_json.loads(ln) for ln in (log_dir / f"{run_id}.jsonl").read_text().splitlines() if ln]
+        policy_event = next(event for event in events if event["event"] == "policy_decision")
+        assert policy_event["data"]["decision"] == "needs_approval"
+        assert policy_event["data"]["reason"] == "Write operations require explicit approval before execution."
+        assert policy_event["data"]["approval_request_id"] == result["pending_approval"]["id"]
+        assert "notes.txt" in policy_event["data"]["impact_summary"]

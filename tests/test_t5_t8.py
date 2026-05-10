@@ -14,6 +14,7 @@ import pytest
 from linux_agent.config import AgentConfig
 from linux_agent.policy import (
     PolicyViolation,
+    assess_tool_call,
     evaluate_tool_call,
     resolve_safe_path,
 )
@@ -120,9 +121,79 @@ class TestEvaluateToolCall:
         tc = make_tool_call("list_dir", {"path": "."})
         assert evaluate_tool_call(tc, cfg) == "allow"
 
-    def test_write_file_denied(self, tmp_path: Path) -> None:
+    def test_write_file_requires_approval(self, tmp_path: Path) -> None:
         cfg = make_config(tmp_path)
         tc = make_tool_call("write_file", {"path": "out.txt", "content": "x"})
+        assessment = assess_tool_call(tc, cfg, run_id="run-123")
+
+        assert assessment["decision"] == "needs_approval"
+        assert assessment["approval_request"] is not None
+        assert assessment["approval_request"]["tool"] == "write_file"
+        assert "out.txt" in assessment["approval_request"]["impact_summary"]
+        assert "run-123" in str(assessment["approval_request"]["backup_plan"])
+        assert evaluate_tool_call(tc, cfg) == "needs_approval"
+
+    def test_write_file_outside_workspace_denied(self, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path)
+        tc = make_tool_call("write_file", {"path": "../outside.txt", "content": "x"})
+
+        assessment = assess_tool_call(tc, cfg)
+
+        assert assessment["decision"] == "deny"
+        assert assessment["approval_request"] is None
+
+    def test_apply_patch_requires_approval(self, tmp_path: Path) -> None:
+        (tmp_path / "note.txt").write_text("old\n")
+        cfg = make_config(tmp_path)
+        tc = make_tool_call(
+            "apply_patch",
+            {
+                "patch": (
+                    "*** Begin Patch\n"
+                    "*** Update File: note.txt\n"
+                    "@@\n"
+                    "-old\n"
+                    "+new\n"
+                    "*** End Patch"
+                )
+            },
+        )
+
+        assessment = assess_tool_call(tc, cfg, run_id="run-456")
+
+        assert assessment["decision"] == "needs_approval"
+        assert assessment["approval_request"] is not None
+        assert "note.txt" in assessment["approval_request"]["impact_summary"]
+        assert "run-456" in str(assessment["approval_request"]["backup_plan"])
+
+    def test_apply_patch_sensitive_target_denied(self, tmp_path: Path) -> None:
+        (tmp_path / ".ssh").mkdir()
+        cfg = make_config(tmp_path)
+        tc = make_tool_call(
+            "apply_patch",
+            {
+                "patch": (
+                    "*** Begin Patch\n"
+                    "*** Update File: .ssh/id_rsa\n"
+                    "@@\n"
+                    "-old\n"
+                    "+new\n"
+                    "*** End Patch"
+                )
+            },
+        )
+
+        assert evaluate_tool_call(tc, cfg) == "deny"
+
+    def test_apply_patch_oversized_payload_denied(self, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path, max_patch_bytes=32)
+        tc = make_tool_call(
+            "apply_patch",
+            {
+                "patch": "*** Begin Patch\n*** Add File: note.txt\n+" + ("x" * 128) + "\n*** End Patch",
+            },
+        )
+
         assert evaluate_tool_call(tc, cfg) == "deny"
 
     def test_path_traversal_denied(self, tmp_path: Path) -> None:

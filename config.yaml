@@ -54,6 +54,11 @@ command_env_allowlist:
 	- RUFF_OUTPUT_FORMAT
 command_working_dirs:
 	- .
+write_requires_approval: true
+max_patch_bytes: 32768
+max_patch_hunks: 24
+backup_dir: .linux-agent/backups
+auto_rollback_on_verify_failure: true
 llm_model: deepseek-v4-pro
 llm_temperature: 0.0
 llm_base_url: https://api.deepseek.com

@@ -12,7 +12,7 @@
 - 对高风险操作触发人工确认或策略拒绝。
 - 记录完整行动轨迹，便于调试、复盘和安全审计。
 
-> 当前仓库已完整覆盖第一阶段只读能力，并已落地第二阶段的核心执行链路：命令执行配置、命令策略解析、`run_command` skill、graph 集成、命令审计与 verbose 输出、以及命令结果驱动的 Reflector / Finalizer 总结。默认仍使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`。第三阶段的审批写入链路仍属于后续工作。
+> 当前仓库已完整覆盖第一阶段只读能力，并已落地第二阶段的核心执行链路：命令执行配置、命令策略解析、`run_command` skill、graph 集成、命令审计与 verbose 输出、以及命令结果驱动的 Reflector / Finalizer 总结。默认仍使用 `deepseek-v4-pro`，通过 OpenAI 兼容接口接入 `https://api.deepseek.com`。第三阶段中，审批模型相关基础（`needs_approval`、`pending_approval`、写操作配置、写策略决策）已经落地，但真正的写 skill、审批暂停/恢复、备份回滚仍属于后续工作。
 
 ### 1.1 当前阶段 2 实现边界（2026-05-10）
 
@@ -20,6 +20,13 @@
 - 已完成的阶段 2 验收场景包括：失败测试诊断、类型检查失败总结、命令失败后的文件回读与下一步建议。
 - 当前仍不支持：任意 shell 语法、交互式命令、后台常驻进程、联网下载或安装依赖。
 - `apply_patch` / `write_file` 尚未实现，仍属于阶段 3 的审批写入链路。
+
+### 1.2 当前阶段 3 已落地基础（2026-05-10）
+
+- `AgentState` 已支持 `risk_decision = "needs_approval"` 与 `pending_approval`，可以表达“等待审批”的中间结果。
+- `AgentConfig` 已新增 `write_requires_approval`、`max_patch_bytes`、`max_patch_hunks`、`backup_dir`、`auto_rollback_on_verify_failure`。
+- `policy.py` 已能对 `write_file` / `apply_patch` 给出 `needs_approval` 或 `deny`，并生成结构化审批理由、影响摘要和备份计划。
+- 当前仍未实现：`apply_patch` / `write_file` 的真实执行、审批暂停/恢复、写后验证与回滚。
 
 ## 2. 范围与非目标
 

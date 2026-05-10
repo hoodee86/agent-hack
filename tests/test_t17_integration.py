@@ -37,6 +37,7 @@ def _initial_state(goal: str, workspace_root: str) -> AgentState:
         proposed_tool_call=None,
         observations=[],
         risk_decision=None,
+        pending_approval=None,
         iteration_count=0,
         consecutive_failures=0,
         final_answer=None,
@@ -404,7 +405,7 @@ class TestScenarioSecurityBlock:
         assert result["observations"] == []
 
     def test_write_tool_blocked(self, tmp_path: Path) -> None:
-        """A non-read-only tool is rejected without any tool execution."""
+        """A write tool now stops for approval without any tool execution."""
         cfg = _make_config(tmp_path)
         llm = _stub(
             _tool_turn(
@@ -416,8 +417,11 @@ class TestScenarioSecurityBlock:
         app = build_graph(cfg, chat_model=llm)
         result = app.invoke(_initial_state("Write file", str(tmp_path)))
 
-        assert result["risk_decision"] == "deny"
+        assert result["risk_decision"] == "needs_approval"
+        assert result["pending_approval"] is not None
+        assert result["pending_approval"]["tool"] == "write_file"
         assert result["iteration_count"] == 0
+        assert result["observations"] == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -484,6 +488,7 @@ class TestScenarioAuditLog:
             proposed_tool_call=None,
             observations=[],
             risk_decision=None,
+            pending_approval=None,
             iteration_count=0,
             consecutive_failures=0,
             final_answer=None,
