@@ -1,0 +1,8 @@
+workspace_root: ./workspace
+max_iterations: 12
+max_read_bytes: 65536
+max_search_results: 100
+max_list_entries: 200
+llm_model: gpt-4o
+llm_temperature: 0.0
+log_dir: logs
