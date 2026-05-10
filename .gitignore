@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+*.whl
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# uv
+uv.lock
+
+# Type checking
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Agent runtime output
+logs/
+workspace/
+
+# Secrets / config overrides
+.env
+*.local.yaml
+*.secret.yaml
