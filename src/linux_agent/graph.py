@@ -208,21 +208,45 @@ def _make_planner(
     """Return a Planner node function closed over *config* and *llm*.
 
     Supports three structured-output strategies via config.llm_structured_output_method:
-    - "function_calling" : tool_choice-based (deepseek-chat, GPT models)
+    - "function_calling" : bind_tools without forced tool_choice (DeepSeek / most providers)
     - "json_schema"      : OpenAI json_schema mode (GPT-4o, o-series)
-    - "prompt"           : pure text + JSON extraction (deepseek-reasoner/R1, any model)
+    - "prompt"           : pure text + JSON extraction (fallback for any model)
     """
-    use_prompt_mode = config.llm_structured_output_method == "prompt"
+    method = config.llm_structured_output_method
 
-    if use_prompt_mode:
+    if method == "function_calling":
+        # Bind PlannerDecision as a tool WITHOUT tool_choice so DeepSeek doesn't
+        # reject the request.  LangChain's with_structured_output forces
+        # tool_choice=<name> which DeepSeek rejects with a 400 error.
+        llm_with_tools = llm.bind_tools([PlannerDecision])
+        structured_llm = None
+        system_prompt = _SYSTEM_PROMPT
+    elif method == "prompt":
+        llm_with_tools = None
         structured_llm = None
         system_prompt = _SYSTEM_PROMPT + _JSON_SCHEMA_PROMPT
     else:
+        # json_schema or any future method supported by with_structured_output
+        llm_with_tools = None
         structured_llm = llm.with_structured_output(
             PlannerDecision,
-            method=config.llm_structured_output_method,
+            method=method,
         )
         system_prompt = _SYSTEM_PROMPT
+
+    def _parse_tool_call_response(response: Any) -> PlannerDecision:
+        """Parse a bind_tools response into PlannerDecision.
+
+        Tries tool_calls first, then falls back to JSON in content.
+        """
+        tool_calls = getattr(response, "tool_calls", None)
+        if tool_calls:
+            args = tool_calls[0]["args"]
+            return PlannerDecision(**args)
+        # Fallback: model replied in plain text instead of calling the tool
+        text = response.content if hasattr(response, "content") else str(response)
+        parsed = _extract_json(str(text))
+        return PlannerDecision(**parsed)
 
     def planner(state: AgentState) -> dict[str, Any]:
         run_id = state["run_id"]
@@ -248,7 +272,18 @@ def _make_planner(
             HumanMessage(content=user_content),
         ]
 
-        if use_prompt_mode:
+        if method == "function_calling":
+            raw = llm_with_tools.invoke(lc_messages)  # type: ignore[union-attr]
+            try:
+                decision = _parse_tool_call_response(raw)
+            except Exception as exc:
+                decision = PlannerDecision(
+                    thought=f"Tool-call parse error: {exc}",
+                    plan=state["plan"],
+                    current_step="Parse error",
+                    final_answer=f"Agent encountered a response parse error: {exc}",
+                )
+        elif method == "prompt":
             raw = llm.invoke(lc_messages)
             text = raw.content if hasattr(raw, "content") else str(raw)
             try:

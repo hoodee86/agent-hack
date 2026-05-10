@@ -24,7 +24,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 
@@ -76,6 +76,27 @@ class _CyclicStubLLM(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         return ChatResult(generations=[ChatGeneration(message=MagicMock())])
+
+    def bind_tools(self, tools: Any, *, tool_choice: Any = None, **kwargs: Any) -> Any:  # type: ignore[override]
+        decisions = self.decisions
+
+        def _invoke(messages: Any, **kw: Any) -> AIMessage:
+            idx = min(self._call_count, len(decisions) - 1)
+            self._call_count += 1  # type: ignore[misc]
+            decision = decisions[idx]
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "PlannerDecision",
+                        "args": decision.model_dump(),
+                        "id": f"call_{idx}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+
+        return RunnableLambda(_invoke)
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:  # type: ignore[override]
         decisions = self.decisions
