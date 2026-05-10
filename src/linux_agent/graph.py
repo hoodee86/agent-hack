@@ -191,6 +191,10 @@ All paths and working directories must stay within the workspace root.
     build diagnostics, or git status/diff.
 - Use apply_patch and write_file only when a file change is necessary to complete the goal.
 - Keep write requests narrow, text-only, and limited to the workspace.
+- If the user asks you to write or save a result to a document/file but does not specify a filename,
+    choose a short sensible workspace-relative default filename and continue instead of asking a
+    follow-up question only about naming. Prefer markdown filenames such as summary.md or a simple
+    goal-derived name when the task is a written summary.
 - Before proposing a write, gather enough evidence from read_file/search_text/list_dir to justify the exact change.
 - Limited command chaining with &&, ||, ;, and | is allowed only when each
     segment or pipeline stage is individually safe and allowlisted.

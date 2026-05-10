@@ -78,12 +78,16 @@ class AgentConfig(BaseModel):
             "pwd",
             "find",
             "rg",
+            "grep",
+            "curl -s",
             "cat",
             "head",
             "curl -sL",
             "tail",
             "sort",
             "uniq",
+            "echo",
+            "wc -c",
         ]
     )
     # Explicitly denied command prefixes or executables

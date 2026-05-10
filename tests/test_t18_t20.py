@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import shlex
 import shutil
 import threading
 import textwrap
@@ -49,7 +50,10 @@ class TestT18Config:
         assert config.max_stderr_bytes == 32768
         assert "uv run pytest" in config.command_allowlist
         assert "cat" in config.command_allowlist
+        assert "grep" in config.command_allowlist
+        assert "curl -s" in config.command_allowlist
         assert "curl -sL" in config.command_allowlist
+        assert "wc -c" in config.command_allowlist
         assert "uniq" in config.command_allowlist
         assert "sudo" in config.command_denylist
         assert config.command_working_dirs == ["."]
@@ -223,6 +227,69 @@ class TestT19CommandPolicy:
             == "allow"
         )
 
+    def test_evaluate_command_call_allows_allowlisted_grep_pipeline(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -s", "grep", "head"],
+            command_denylist=["curl"],
+        )
+
+        assert (
+            evaluate_command_call(
+                "curl -s -L --max-time 15 https://example.com 2>&1 | grep -oP 'title' | head -50",
+                config,
+            )
+            == "allow"
+        )
+
+    def test_evaluate_command_call_allows_safe_inline_python_json_reader(self, tmp_path: Path) -> None:
+        config = make_config(tmp_path)
+        (tmp_path / "baidu_hot.json").write_text(
+            '{"data": {"cards": [{"component": "hotList", "content": [{"index": 0, "word": "A", "desc": "B", "hotScore": "1"}]}]}}',
+            encoding="utf-8",
+        )
+        code = textwrap.dedent(
+            """\
+            import json
+            with open('baidu_hot.json', 'r') as f:
+                data = json.load(f)
+            cards = data['data']['cards']
+            print(len(cards))
+            """
+        ).strip()
+
+        assert evaluate_command_call(shlex.join(["python3", "-c", code]), config) == "allow"
+
+    def test_evaluate_command_call_denies_inline_python_workspace_escape(self, tmp_path: Path) -> None:
+        config = make_config(tmp_path)
+        code = textwrap.dedent(
+            """\
+            import json
+            with open('../outside.json', 'r') as f:
+                data = json.load(f)
+            print(len(data))
+            """
+        ).strip()
+
+        assert evaluate_command_call(shlex.join(["python3", "-c", code]), config) == "deny"
+
+    def test_evaluate_command_call_denies_inline_python_write_mode(self, tmp_path: Path) -> None:
+        config = make_config(tmp_path)
+        code = textwrap.dedent(
+            """\
+            with open('out.txt', 'w') as f:
+                print('hello')
+            """
+        ).strip()
+
+        assert evaluate_command_call(shlex.join(["python3", "-c", code]), config) == "deny"
+
+    def test_evaluate_command_call_denies_inline_python_unsafe_import(self, tmp_path: Path) -> None:
+        config = make_config(tmp_path)
+        code = "import os\nprint(os.listdir('.'))"
+
+        assert evaluate_command_call(shlex.join(["python3", "-c", code]), config) == "deny"
+
     def test_evaluate_command_call_allows_allowlisted_compact_curl_flags(self, tmp_path: Path) -> None:
         config = make_config(
             tmp_path,
@@ -279,6 +346,47 @@ class TestT19CommandPolicy:
     def test_evaluate_tool_call_dispatches_run_command(self, tmp_path: Path) -> None:
         config = make_config(tmp_path)
         tool_call = make_tool_call("run_command", {"command": "pytest -q", "cwd": "."})
+
+        assert evaluate_tool_call(tool_call, config) == "allow"
+
+    def test_evaluate_tool_call_requires_approval_for_run_command_file_output(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -sL", "head"],
+            command_denylist=["curl"],
+        )
+        tool_call = make_tool_call(
+            "run_command",
+            {"command": "curl -sL -o out.html --max-time 15 https://example.com 2>&1 && head -c 200 out.html", "cwd": "."},
+        )
+
+        assert evaluate_tool_call(tool_call, config) == "needs_approval"
+
+    def test_evaluate_tool_call_denies_run_command_file_output_outside_workspace(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -sL", "head"],
+            command_denylist=["curl"],
+        )
+        outside_path = (tmp_path.parent / "outside.html").resolve()
+        tool_call = make_tool_call(
+            "run_command",
+            {"command": f"curl -sL -o {outside_path} --max-time 15 https://example.com 2>&1 && head -c 200 {outside_path}", "cwd": "."},
+        )
+
+        assert evaluate_tool_call(tool_call, config) == "deny"
+
+    def test_evaluate_tool_call_allows_run_command_file_output_when_write_approval_disabled(self, tmp_path: Path) -> None:
+        config = make_config(
+            tmp_path,
+            command_allowlist=["curl -sL", "head"],
+            command_denylist=["curl"],
+            write_requires_approval=False,
+        )
+        tool_call = make_tool_call(
+            "run_command",
+            {"command": "curl -sL -o out.html --max-time 15 https://example.com 2>&1 && head -c 200 out.html", "cwd": "."},
+        )
 
         assert evaluate_tool_call(tool_call, config) == "allow"
 

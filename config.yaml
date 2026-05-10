@@ -5,7 +5,7 @@ max_search_results: 100
 max_list_entries: 200
 max_command_count: 8
 max_runtime_seconds: 900
-max_plan_revisions: 3
+max_plan_revisions: 10
 max_recovery_attempts_per_issue: 2
 budget_warning_ratio: 0.8
 reflection_replan_threshold: 60
@@ -31,6 +31,7 @@ command_allowlist:
   - pwd
   - find
   - rg
+  - grep
   - curl -s
   - curl -sL
   - cat

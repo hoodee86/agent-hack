@@ -8,6 +8,7 @@ stateless so they are easy to unit-test in isolation.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping
 from pathlib import Path
 import re
@@ -64,6 +65,40 @@ _BINARY_PATH_SUFFIXES: frozenset[str] = frozenset(
 _PATCH_FILE_RE = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$", re.MULTILINE)
 _UNIFIED_DIFF_PATH_RE = re.compile(r"^(?:--- a/|\+\+\+ b/)(.+)$", re.MULTILINE)
 _PATCH_HUNK_RE = re.compile(r"^@@", re.MULTILINE)
+_INLINE_PYTHON_EXECUTABLES: frozenset[str] = frozenset({"python", "python3"})
+_INLINE_PYTHON_SAFE_IMPORTS: frozenset[str] = frozenset({"json"})
+_INLINE_PYTHON_SAFE_BUILTINS: frozenset[str] = frozenset({"len", "open", "print"})
+_INLINE_PYTHON_SAFE_JSON_CALLS: frozenset[str] = frozenset({"load", "loads"})
+_INLINE_PYTHON_SAFE_READ_MODES: frozenset[str] = frozenset({"r", "rb", "rt"})
+_INLINE_PYTHON_SAFE_NODE_TYPES: tuple[type[ast.AST], ...] = (
+    ast.Add,
+    ast.Assign,
+    ast.Attribute,
+    ast.BinOp,
+    ast.Call,
+    ast.Compare,
+    ast.Constant,
+    ast.Dict,
+    ast.Eq,
+    ast.Expr,
+    ast.For,
+    ast.FormattedValue,
+    ast.If,
+    ast.Import,
+    ast.JoinedStr,
+    ast.List,
+    ast.Load,
+    ast.Module,
+    ast.Mult,
+    ast.Name,
+    ast.Store,
+    ast.Subscript,
+    ast.Tuple,
+    ast.With,
+    ast.alias,
+    ast.keyword,
+    ast.withitem,
+)
 
 
 class CommandStage(TypedDict):
@@ -666,6 +701,14 @@ def assess_tool_call(
             env=raw_env,
         )
         if decision == "allow":
+            write_assessment = _assess_run_command_write_effects(
+                tool_call,
+                config,
+                cwd=str(raw_cwd) if raw_cwd is not None else ".",
+                run_id=run_id,
+            )
+            if write_assessment is not None:
+                return write_assessment
             return _allow()
         return _deny("command denied by command policy")
 
@@ -689,6 +732,8 @@ def assess_tool_call(
 def classify_command(
     argv: list[str],
     config: "AgentConfig",
+    *,
+    cwd: str = ".",
 ) -> Literal["low", "medium", "high"]:
     """Classify a parsed command according to the configured command policy."""
     normalized = _normalize_command_text(argv)
@@ -697,9 +742,12 @@ def classify_command(
 
     inner = _unwrap_uv_run(argv)
     if inner:
-        inner_risk = classify_command(inner, config)
+        inner_risk = classify_command(inner, config, cwd=cwd)
         if inner_risk != "high":
             return inner_risk
+
+    if _is_safe_inline_python_command(argv, config, cwd=cwd):
+        return "low"
 
     deny_match = _best_command_prefix_length(normalized, config.command_denylist)
     approval_match = _best_command_prefix_length(normalized, config.command_approvallist)
@@ -721,12 +769,14 @@ def classify_command(
 def classify_command_sequence(
     segments: list[CommandSegment],
     config: "AgentConfig",
+    *,
+    cwd: str = ".",
 ) -> Literal["low", "medium", "high"]:
     """Classify a sequential command chain using the highest segment risk."""
     highest: Literal["low", "medium", "high"] = "low"
     for segment in segments:
         for stage in command_segment_stages(segment):
-            risk = classify_command(stage["argv"], config)
+            risk = classify_command(stage["argv"], config, cwd=cwd)
             if risk == "high":
                 return "high"
             if risk == "medium":
@@ -757,6 +807,279 @@ def resolve_command_cwd(
             return resolved_cwd
 
     raise PolicyViolation("command cwd is not in allowed working directories", path=raw_cwd)
+
+
+def _resolve_command_output_path(
+    config: "AgentConfig",
+    raw_path: str,
+    *,
+    cwd: str = ".",
+) -> Path:
+    output_path = Path(raw_path)
+    if output_path.is_absolute():
+        return resolve_safe_path(
+            config.workspace_root,
+            raw_path,
+            config.sensitive_path_parts,
+        )
+
+    resolved_cwd = resolve_command_cwd(config, cwd)
+    relative_cwd = resolved_cwd.relative_to(config.workspace_root)
+    workspace_relative = relative_cwd / output_path
+    return resolve_safe_path(
+        config.workspace_root,
+        str(workspace_relative),
+        config.sensitive_path_parts,
+    )
+
+
+def _resolve_command_input_path(
+    config: "AgentConfig",
+    raw_path: str,
+    *,
+    cwd: str = ".",
+) -> Path:
+    input_path = Path(raw_path)
+    if input_path.is_absolute():
+        return resolve_safe_path(
+            config.workspace_root,
+            raw_path,
+            config.sensitive_path_parts,
+        )
+
+    resolved_cwd = resolve_command_cwd(config, cwd)
+    relative_cwd = resolved_cwd.relative_to(config.workspace_root)
+    workspace_relative = relative_cwd / input_path
+    return resolve_safe_path(
+        config.workspace_root,
+        str(workspace_relative),
+        config.sensitive_path_parts,
+    )
+
+
+class _InlinePythonPolicyValidator(ast.NodeVisitor):
+    def __init__(self, config: "AgentConfig", *, cwd: str) -> None:
+        self._config = config
+        self._cwd = cwd
+        self._parents: dict[ast.AST, ast.AST] = {}
+        self._reserved_names = (
+            _INLINE_PYTHON_SAFE_IMPORTS | _INLINE_PYTHON_SAFE_BUILTINS
+        )
+
+    def validate(self, tree: ast.AST) -> bool:
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                self._parents[child] = parent
+        self.visit(tree)
+        return True
+
+    def generic_visit(self, node: ast.AST) -> None:
+        if not isinstance(node, _INLINE_PYTHON_SAFE_NODE_TYPES):
+            raise PolicyViolation(
+                "inline python command is not in the safe read-only subset"
+            )
+        super().generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name not in _INLINE_PYTHON_SAFE_IMPORTS or alias.asname is not None:
+                raise PolicyViolation(
+                    "inline python command is not in the safe read-only subset"
+                )
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        parent = self._parents.get(node)
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "json"
+            and node.attr in _INLINE_PYTHON_SAFE_JSON_CALLS
+            and isinstance(parent, ast.Call)
+            and parent.func is node
+        ):
+            self.generic_visit(node)
+            return
+        raise PolicyViolation("inline python command is not in the safe read-only subset")
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id.startswith("__"):
+            raise PolicyViolation("inline python command is not in the safe read-only subset")
+        if isinstance(node.ctx, ast.Store) and node.id in self._reserved_names:
+            raise PolicyViolation("inline python command is not in the safe read-only subset")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name):
+            if node.func.id == "open":
+                self._validate_open_call(node)
+            elif node.func.id == "print":
+                if node.keywords:
+                    raise PolicyViolation(
+                        "inline python command is not in the safe read-only subset"
+                    )
+            elif node.func.id == "len":
+                if len(node.args) != 1 or node.keywords:
+                    raise PolicyViolation(
+                        "inline python command is not in the safe read-only subset"
+                    )
+            else:
+                raise PolicyViolation(
+                    "inline python command is not in the safe read-only subset"
+                )
+        elif isinstance(node.func, ast.Attribute):
+            if not (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "json"
+                and node.func.attr in _INLINE_PYTHON_SAFE_JSON_CALLS
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                raise PolicyViolation(
+                    "inline python command is not in the safe read-only subset"
+                )
+        else:
+            raise PolicyViolation("inline python command is not in the safe read-only subset")
+        self.generic_visit(node)
+
+    def _validate_open_call(self, node: ast.Call) -> None:
+        if not node.args or len(node.args) > 2 or node.keywords:
+            raise PolicyViolation("inline python command is not in the safe read-only subset")
+        path_arg = node.args[0]
+        if not isinstance(path_arg, ast.Constant) or not isinstance(path_arg.value, str):
+            raise PolicyViolation("inline python command is not in the safe read-only subset")
+
+        mode = "r"
+        if len(node.args) == 2:
+            mode_arg = node.args[1]
+            if not isinstance(mode_arg, ast.Constant) or not isinstance(mode_arg.value, str):
+                raise PolicyViolation(
+                    "inline python command is not in the safe read-only subset"
+                )
+            mode = mode_arg.value
+
+        if mode not in _INLINE_PYTHON_SAFE_READ_MODES:
+            raise PolicyViolation("inline python command is not in the safe read-only subset")
+
+        _resolve_command_input_path(self._config, path_arg.value, cwd=self._cwd)
+
+
+def _is_safe_inline_python_command(
+    argv: list[str],
+    config: "AgentConfig",
+    *,
+    cwd: str = ".",
+) -> bool:
+    inner = _unwrap_uv_run(argv) or argv
+    if len(inner) != 3:
+        return False
+    if inner[0] not in _INLINE_PYTHON_EXECUTABLES or inner[1] != "-c":
+        return False
+
+    try:
+        tree = ast.parse(inner[2], mode="exec")
+        return _InlinePythonPolicyValidator(config, cwd=cwd).validate(tree)
+    except (PolicyViolation, SyntaxError, ValueError):
+        return False
+
+
+def _extract_curl_output_targets(argv: list[str]) -> tuple[list[str], bool]:
+    inner = _unwrap_uv_run(argv) or argv
+    if not inner or inner[0] != "curl":
+        return [], False
+
+    targets: list[str] = []
+    writes_to_cwd = False
+    index = 1
+    while index < len(inner):
+        arg = inner[index]
+        if arg in {"-o", "--output"}:
+            if index + 1 >= len(inner):
+                raise PolicyViolation("curl output flag is missing a path")
+            targets.append(inner[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--output="):
+            output = arg.split("=", 1)[1]
+            if not output:
+                raise PolicyViolation("curl output flag is missing a path")
+            targets.append(output)
+            index += 1
+            continue
+        if arg.startswith("-o") and len(arg) > 2:
+            targets.append(arg[2:])
+            index += 1
+            continue
+        if arg in {"-O", "--remote-name", "--remote-name-all"}:
+            writes_to_cwd = True
+        index += 1
+
+    return targets, writes_to_cwd
+
+
+def _assess_run_command_write_effects(
+    tool_call: "ToolCall",
+    config: "AgentConfig",
+    *,
+    cwd: str = ".",
+    run_id: str | None,
+) -> PolicyAssessment | None:
+    raw_command = str(tool_call["args"].get("command", "") or "")
+    segments = parse_command_sequence(raw_command)
+    display_paths: list[str] = []
+    seen_paths: set[str] = set()
+    writes_to_dirs: list[str] = []
+    seen_dirs: set[str] = set()
+
+    for segment in segments:
+        for stage in command_segment_stages(segment):
+            output_targets, writes_to_cwd = _extract_curl_output_targets(stage["argv"])
+            for raw_path in output_targets:
+                try:
+                    resolved = _resolve_command_output_path(config, raw_path, cwd=cwd)
+                except PolicyViolation as exc:
+                    return _deny(exc.reason)
+                display_path = _workspace_display_path(config, resolved)
+                if display_path not in seen_paths:
+                    display_paths.append(display_path)
+                    seen_paths.add(display_path)
+            if writes_to_cwd:
+                resolved_cwd = resolve_command_cwd(config, cwd)
+                display_dir = _workspace_display_path(config, resolved_cwd)
+                if display_dir not in seen_dirs:
+                    writes_to_dirs.append(display_dir)
+                    seen_dirs.add(display_dir)
+
+    if not display_paths and not writes_to_dirs:
+        return None
+
+    if not config.write_requires_approval:
+        return None
+
+    if display_paths:
+        impact_summary = (
+            "This command would write workspace file(s): "
+            + ", ".join(display_paths[:5])
+            + ("." if len(display_paths) <= 5 else f" (+{len(display_paths) - 5} more).")
+        )
+        affected_files = display_paths
+    else:
+        impact_summary = (
+            "This command would write downloaded file(s) into workspace directory "
+            f"'{writes_to_dirs[0]}'."
+        )
+        affected_files = writes_to_dirs
+
+    request = _build_approval_request(
+        tool_call,
+        reason="Command execution that writes files requires explicit approval before execution.",
+        impact_summary=impact_summary,
+        diff_preview=_preview_text(raw_command),
+        backup_plan="No automatic backup is available for run_command writes.",
+        affected_files=affected_files,
+        suggested_verification_command=_suggest_verification_command(config, display_paths),
+        rollback_command=None if run_id is None else f"--rollback-run {run_id}",
+    )
+    return _needs_approval(request)
 
 
 def filter_command_env(
@@ -790,7 +1113,7 @@ def evaluate_command_call(
         resolve_command_cwd(config, cwd)
         if env is not None and not isinstance(env, Mapping):
             return "deny"
-        risk = classify_command_sequence(segments, config)
+        risk = classify_command_sequence(segments, config, cwd=cwd)
     except PolicyViolation:
         return "deny"
 
